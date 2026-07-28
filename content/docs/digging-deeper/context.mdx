@@ -1,0 +1,74 @@
+---
+title: Request Context
+description: Async-safe context variables that carry the current user and request through your call stack.
+icon: Braces
+---
+
+Alata provides request-scoped context variables built on Python's `contextvars` — values you set once, early in a request, and read anywhere downstream without threading them through every function signature. Because they are `ContextVar`s, they are async-safe: concurrent requests never see each other's values.
+
+## The context variables
+
+`alata.context` defines two variables:
+
+```python
+from alata.context import request_context, user_id_context
+
+user_id_context: ContextVar[str | None]   # the authenticated user's id
+request_context: ContextVar[dict | None]  # arbitrary per-request metadata
+```
+
+Both default to `None`. The framework declares them but does **not** populate them — that's your application's job, typically in middleware, which is what makes them request-scoped in practice.
+
+## Setting context from middleware
+
+Set a variable with `.set()`, which returns a token, and restore the previous value with `.reset(token)` when the request ends:
+
+```python title="app/http/middleware.py"
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from alata.context import user_id_context
+
+
+class IdentityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        token = user_id_context.set(resolve_user_id(request))  # your auth logic
+        try:
+            return await call_next(request)
+        finally:
+            user_id_context.reset(token)
+```
+
+`request_context` works the same way — stash whatever per-request dict you find useful (request id, tenant, locale) and read it downstream.
+
+## Reading context
+
+Anywhere in the same request's call stack — services, event listeners, query scopes — read the current value with `.get()`:
+
+```python
+from alata.context import user_id_context
+
+async def record_audit_entry(action: str) -> None:
+    await AuditLog.acreate({"action": action, "user_id": user_id_context.get()})
+```
+
+`.get()` returns `None` when nothing has been set, so code that runs outside a request (CLI commands, workers) keeps working.
+
+## Context in exception reports
+
+The [exception handler](/docs/basics/error-handling) reads `user_id_context` automatically: its `context()` method contributes the current user id to every reported exception, so error logs and trackers show *who* hit the error without any per-callsite effort. Override `context()` in your application's handler subclass to add more:
+
+```python title="app/exceptions/handler.py"
+from alata.context import request_context
+from alata.exceptions.handler import ExceptionHandler
+
+
+class Handler(ExceptionHandler):
+    def context(self) -> dict:
+        ctx = super().context()  # includes user_id
+        ctx.update(request_context.get() or {})
+        return ctx
+```
+
+<Callout type="warn">
+Context variables live inside one process. They do not travel with a [queued job](/docs/digging-deeper/queues) — a worker runs in a different process with fresh, empty context. Pass anything a job needs (like the user id) as an explicit task argument.
+</Callout>

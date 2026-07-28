@@ -1,0 +1,228 @@
+---
+title: Collections
+description: A fluent, chainable list subclass with dozens of helpers for filtering, transforming, and aggregating data.
+icon: Layers
+---
+
+`Collection` is a `list` subclass loaded with chainable helper methods. Because it *is* a list, everything that indexes, iterates, or unpacks a list keeps working — but every method that returns a sequence returns a new `Collection`, so calls chain fluently:
+
+```python
+from alata.support.collection import collect
+
+active_names = (
+    collect(users)
+    .where("is_active", True)
+    .sort_by("name")
+    .pluck("name")
+    .unique()
+)
+```
+
+## Creating collections
+
+```python
+from alata.support.collection import Collection, collect
+
+collect([1, 2, 3])                       # from any iterable
+Collection(["a", "b"])                   # direct construction
+Collection.wrap(maybe_list_or_scalar)    # wraps a scalar into [scalar]; passes Collections through
+Collection.times(5, lambda i: i * 2)     # [0, 2, 4, 6, 8]
+```
+
+The class is generic, so annotate for IDE auto-complete:
+
+```python
+users: Collection[User] = User.all()
+users.first().name  # IDE knows this is a User
+```
+
+### Where the framework returns collections
+
+Query results are already collections — no wrapping needed. `Model.all()`, `Model.find_many()`, their async twins `aall()` / `afind_many()`, and the [query builder's](/docs/database/getting-started) `get()` / `aget()` and `pluck()` / `apluck()` all return `Collection` instances:
+
+```python
+admins = await User.where("role", "admin").aget()   # Collection[User]
+emails = admins.pluck("email").unique()
+```
+
+Throughout the reference below, a *key* argument accepts an attribute name (works on both objects and dicts) or a callable.
+
+## Filtering
+
+| Method | Description |
+| --- | --- |
+| `filter(fn=None)` | Keep items where `fn` is truthy; with no argument, drop falsy values. |
+| `reject(fn)` | Inverse of `filter`. |
+| `where(key, value)` / `where(key, op, value)` | Filter by attribute with optional operator: `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`. |
+| `where_in(key, values)` / `where_not_in(key, values)` | Membership filters. |
+| `where_null(key)` / `where_not_null(key)` | Filter by `None` / not `None`. |
+| `where_between(key, (lo, hi))` | Inclusive range filter. |
+| `unique(key=None)` | Deduplicate items, optionally by key. |
+| `duplicates(key=None)` | Items that appear more than once. |
+| `partition(fn)` | Split into a `(truthy, falsy)` tuple of collections. |
+| `skip_while(fn)` / `skip_until(fn)` | Drop leading items while/until the predicate flips. |
+| `take_while(fn)` / `take_until(fn)` | Keep leading items while/until the predicate flips. |
+
+```python
+users.where("age", ">=", 18).where_in("country", ["JP", "NP"])
+active, inactive = users.partition(lambda u: u.is_active)
+```
+
+## Retrieving items
+
+| Method | Description |
+| --- | --- |
+| `first(fn=None, default=None)` | First item, or first matching `fn`. |
+| `last(fn=None, default=None)` | Last item, or last matching `fn`. |
+| `first_where(key, value)` / `first_where(key, op, value)` | Sugar for `where(...).first()`. |
+| `sole()` | The only item — raises `ValueError` if empty or more than one. |
+| `random(n=None)` | One random item, or a collection of `n`. |
+| `search(value_or_fn)` | Index of the first match, or `False`. |
+| `contains(value)` / `contains(fn)` / `contains(key, value)` | Membership / predicate / attribute check. |
+| `doesnt_contain(...)` | Inverse of `contains`. |
+| `every(fn)` | `True` if all items satisfy `fn`. |
+
+```python
+vip = users.first_where("plan", "enterprise")
+config = collect(matches).sole()   # asserts exactly one result
+```
+
+## Transforming
+
+| Method | Description |
+| --- | --- |
+| `map(fn)` | Transform each item. |
+| `flat_map(fn)` | Map, then flatten one level. |
+| `map_into(cls)` | Transform each item via `cls(item)`. |
+| `map_with_keys(fn)` | Map each item to a `(key, value)` pair; returns a `dict`. |
+| `pmap(fn, workers=4)` | Parallel map on a thread pool — for I/O-bound work. |
+| `pluck(value, key=None)` | Extract one attribute; with `key`, returns a `dict` keyed by it. |
+| `transform(fn)` | **In-place** map; returns `self`. |
+| `each(fn)` | Call `fn` per item for side effects; returns `self`. |
+| `tap(fn)` | Call `fn(collection)` for side effects; returns `self`. |
+| `pipe(fn)` | Pass the collection to `fn` and return its result. |
+| `values()` | Fresh collection with the same items. |
+
+```python
+lookup = users.map_with_keys(lambda u: (u.id, u.name))   # {1: "Alice", ...}
+pages = collect(urls).pmap(fetch, workers=8)
+```
+
+## Grouping and aggregating
+
+| Method | Description |
+| --- | --- |
+| `group_by(key)` | `{key: Collection}` of items grouped by attribute or callable. |
+| `key_by(key)` | Dict keyed by attribute; last item wins on collision. |
+| `count()` | Number of items. |
+| `count_by(fn=None)` | Frequency map of items, or of `fn(item)`. |
+| `sum(key=None)` / `avg(key=None)` / `min(key=None)` / `max(key=None)` | Aggregates over items or an attribute (`average` is an alias for `avg`). |
+| `median(key=None)` / `mode(key=None)` / `stdev(key=None)` / `variance(key=None)` | Statistical aggregates. |
+| `reduce(fn, initial=None)` | Fold the collection. |
+
+```python
+by_role = users.group_by("role")            # {"admin": Collection[...], ...}
+totals = orders.sum(lambda o: o.amount)
+signups_per_day = events.count_by(lambda e: e.created_at.date())
+```
+
+<Callout type="warn">
+`count()` takes no arguments — it shadows `list.count(value)`. To count occurrences of a value, use `count_by()` or `where(...).count()`.
+</Callout>
+
+## Combining and reshaping
+
+| Method | Description |
+| --- | --- |
+| `merge(*others)` / `concat(other)` | Concatenate with other iterables. |
+| `zip(*others)` | Zip into tuples. |
+| `diff(other)` | Items in self but not in `other`. |
+| `intersect(other)` | Items in both. |
+| `push(*items)` / `prepend(item)` | Append / prepend in place; return `self`. |
+| `put(index, item)` / `forget(index)` / `pull(index, default=None)` | Set, delete, or pop by index. |
+| `pad(size, value=None)` | Pad to `size`; negative pads the front. |
+| `flatten(depth=inf)` / `collapse()` | Flatten nested iterables (`collapse` = one level). |
+| `chunk(size)` | Sub-collections of `size`. |
+| `split(n)` | `n` roughly-equal groups. |
+| `sliding(size, step=1)` | Sliding windows. |
+
+Set-style operators work too: `a | b` (merge), `a & b` (intersect), `a - b` (diff), `a + b` (concatenate).
+
+```python
+for batch in user_ids.chunk(500):
+    await process(batch)
+```
+
+## Ordering, slicing, and inspection
+
+| Method | Description |
+| --- | --- |
+| `sort_by(key, desc=False)` / `sort_by_desc(key)` | Sort by attribute or callable; returns a new collection. |
+| `reverse()` / `shuffle()` | Reversed / shuffled copy. |
+| `take(n)` | First `n` items (last `n` if negative). |
+| `skip(n)` | Drop the first `n` items. |
+| `slice(offset, length=None)` | Slice from `offset`. |
+| `nth(step, offset=0)` | Every `step`-th item. |
+| `only(*keys)` / `except_(*keys)` | For collections of dicts: keep / drop the listed keys. |
+| `join(glue=", ", final_glue=None)` | Join into a string: `collect(["a","b","c"]).join(", ", " and ")` → `"a, b and c"`. |
+| `ensure(*types)` | Raise `TypeError` unless every item is one of `types`. |
+| `is_empty()` / `is_not_empty()` | Emptiness checks. |
+| `dump()` / `dd()` | Print for debugging; `dd()` prints then exits. |
+
+Python slicing returns collections as well: `users[10:20]` is a `Collection`, so you can keep chaining.
+
+<Callout type="warn">
+`reverse()` shadows `list.reverse()`: it returns a **new** reversed collection instead of reversing in place. Similarly, prefer `sort_by()` over the in-place `list.sort()` to stay in fluent style.
+</Callout>
+
+## Conditional chains
+
+`when()` and friends keep a chain fluent without breaking into `if`/`else`. Each takes a callback that receives the collection and returns the (possibly new) collection:
+
+| Method | Description |
+| --- | --- |
+| `when(condition, fn, default=None)` | Apply `fn` if `condition` is truthy, else `default` if given. |
+| `unless(condition, fn, default=None)` | Apply `fn` if `condition` is falsy. |
+| `when_empty(fn)` / `when_not_empty(fn)` | Apply `fn` based on emptiness. |
+
+```python
+results = (
+    users
+    .where("active", True)
+    .when(role, lambda c: c.where("role", role))
+    .when_empty(lambda c: c.push(guest_user))
+    .sort_by("name")
+)
+```
+
+## Relationship loading (model collections)
+
+When a collection holds model instances, four methods batch-load relationships onto the already-fetched results — one query per relation regardless of collection size, using the same machinery as query-time `with_()`. They accept the same entries as `with_()`: plain names, dotted nested paths, and `{name: callable}` constraint dicts.
+
+| Method | Description |
+| --- | --- |
+| `load(*relations)` | Eager-load the relations onto every model; already-loaded relations are re-queried (refreshed). Returns `self`. |
+| `load_missing(*relations)` | Like `load`, but models that already have a relation keep it — only models missing it are queried. Returns `self`. |
+| `aload(*relations)` / `aload_missing(*relations)` | Async twins. |
+
+```python
+users = User.where("active", True).get()
+
+users.load("posts", "profile.settings")           # dotted = nested
+users.load({"posts": lambda q: q.latest()})       # constrained
+await users.aload_missing("posts")                # async, only where absent
+```
+
+These are the only collection methods that touch the database, and they work **only on collections of model instances** — calling them on anything else raises `TypeError`. See [eager loading](/docs/database/models#loading-relations-after-the-fact) on the Models page for the full story.
+
+## Serialization
+
+| Method | Description |
+| --- | --- |
+| `all()` / `to_list()` | The items as a plain `list`. |
+| `to_dict()` | Call `.to_dict()` on each item (model instances); items without one pass through unchanged. |
+| `to_json(**kwargs)` | JSON string via `to_dict()`; `datetime` and `date` values are ISO-formatted. Extra kwargs go to `json.dumps` (e.g. `indent=2`). |
+
+```python
+payload = (await User.aall()).to_json(indent=2)
+```

@@ -1,0 +1,240 @@
+---
+title: Task Scheduling
+description: Define your recurring commands, jobs, and callables in code and drive them with a single cron entry.
+icon: Timer
+---
+
+Instead of scattering cron entries across servers, Alata lets you define your entire recurring-task schedule in one Python file, with a fluent API for frequencies and constraints. A single OS-level cron entry runs `./alata schedule:run` every minute; the scheduler evaluates which events are due and executes them.
+
+## Defining the schedule
+
+The schedule lives in your application's console kernel, in the `schedule()` method:
+
+```python title="app/console/kernel.py"
+from alata.console.kernel import ConsoleKernel
+from alata.console.scheduling.schedule import Schedule
+
+
+class AppKernel(ConsoleKernel):
+    def schedule(self, schedule: Schedule):
+        schedule.command("queue:prune-orphans").hourly()
+        schedule.job("reports:generate").daily_at("02:00").on_one_server()
+        schedule.call(refresh_exchange_rates).every_thirty_minutes()
+```
+
+The scaffolded project ships this file with a working example already in place — the framework schedules `queue:prune-orphans` hourly to keep the queue healthy.
+
+## What you can schedule
+
+The `Schedule` registry offers three event types.
+
+### Console commands
+
+`schedule.command()` runs any `./alata` command in a subprocess:
+
+```python
+schedule.command("migrate:status").daily()
+schedule.command("horizon:snapshot").every_five_minutes()
+```
+
+Command events support output redirection:
+
+```python
+schedule.command("report:send ops@example.com") \
+    .daily_at("06:00") \
+    .send_output_to("storage/logs/report.log")
+
+# Or append instead of overwrite:
+schedule.command("db:status").hourly().append_output_to("storage/logs/db.log")
+```
+
+### Queued jobs
+
+`schedule.job()` dispatches a registered queue task to the broker — the scheduler only pushes the message; a [queue worker](/docs/digging-deeper/queues) does the actual work:
+
+```python
+schedule.job("reports:generate").daily_at("02:00")
+
+# With arguments and a queue override
+schedule.job("reports:generate", user_id="abc", queue="reports").hourly()
+
+# Or set the queue fluently
+schedule.job("emails:digest").daily().on_queue("emails")
+```
+
+The task name must match a task registered on the broker; if it cannot be found, the event fails and logs an error rather than crashing the scheduler.
+
+### Callables
+
+`schedule.call()` runs any Python callable in-process — sync or async:
+
+```python
+async def refresh_exchange_rates():
+    ...
+
+schedule.call(refresh_exchange_rates).every_thirty_minutes()
+schedule.call(lambda: print("heartbeat")).every_five_minutes()
+schedule.call(cleanup, days=30).weekly().description("Prune old audit rows")
+```
+
+Use `.description("...")` to give any event a readable name for `schedule:list` and log output.
+
+## Frequencies
+
+Every event defaults to `* * * * *` (every minute) until you narrow it. All helpers return the event, so they chain.
+
+### Minute-level and above
+
+| Method | Cron |
+| --- | --- |
+| `every_minute()` | `* * * * *` |
+| `every_two_minutes()` / `every_three_minutes()` / `every_four_minutes()` | `*/2`, `*/3`, `*/4` |
+| `every_five_minutes()` / `every_ten_minutes()` / `every_fifteen_minutes()` / `every_thirty_minutes()` | `*/5`, `*/10`, `*/15`, `*/30` |
+| `hourly()` | `0 * * * *` |
+| `hourly_at(17)` or `hourly_at([0, 30])` | at given minute(s) |
+| `every_odd_hour(minute=0)` | hours 1–23 step 2 |
+| `every_two_hours()` / `every_three_hours()` / `every_four_hours()` / `every_six_hours()` | `*/2` … `*/6` hours, minute arg optional |
+| `daily()` | `0 0 * * *` |
+| `daily_at("13:30")` / `at("13:30")` | daily at a time |
+| `twice_daily(1, 13)` / `twice_daily_at(1, 13, minute=30)` | two hours a day |
+| `weekly()` | Sunday 00:00 |
+| `weekly_on(1, "8:00")` | given weekday and time |
+| `monthly()` | 1st at 00:00 |
+| `monthly_on(4, "15:00")` | given day and time |
+| `twice_monthly(1, 16, "13:00")` | two days a month |
+| `last_day_of_month("12:00")` | last day of the current month |
+| `days_of_month(5, 15, 25)` | specific days of the month |
+| `quarterly()` / `quarterly_on(day=1, time="0:0")` | first month of each quarter |
+| `yearly()` / `yearly_on(month=6, day=1, time="9:00")` | once a year |
+| `cron("0 4 * * 1-5")` | any raw cron expression |
+
+### Day-of-week constraints
+
+These modify the weekday segment of whatever frequency you already set:
+
+```python
+schedule.command("report:send").daily_at("08:00").weekdays()
+schedule.command("backup:run").twice_daily(1, 13).sundays()
+```
+
+Available: `weekdays()`, `weekends()`, `mondays()` through `sundays()`, and `days(1, 3, 5)` for arbitrary sets (0 = Sunday).
+
+### Sub-minute frequencies
+
+The scheduler supports repeating an event multiple times within its minute. When any sub-minute event is due, `schedule:run` stays alive until the end of the current minute and re-fires it on the configured interval:
+
+```python
+schedule.call(poll_upstream).every_ten_seconds()
+```
+
+Available: `every_second()`, `every_two_seconds()`, `every_five_seconds()`, `every_ten_seconds()`, `every_fifteen_seconds()`, `every_twenty_seconds()`, `every_thirty_seconds()`. The interval must divide 60 evenly.
+
+## Constraints and filters
+
+### Timezone
+
+Cron expressions are evaluated in UTC by default. `timezone()` switches evaluation to any IANA timezone:
+
+```python
+schedule.command("report:send").daily_at("09:00").timezone("Asia/Tokyo")
+```
+
+### Environments
+
+Restrict an event to specific environments:
+
+```python
+schedule.command("backup:run").daily().environments("production")
+```
+
+### Truth-test filters
+
+`when()` runs the event only if a callback returns `True`; `skip()` is the inverse:
+
+```python
+schedule.call(sync_inventory).hourly().when(lambda: feature_enabled("sync"))
+schedule.call(heavy_job).daily().skip(is_black_friday)
+```
+
+`between()` and `unless_between()` gate execution to a daily time window (they respect the event's timezone, and handle overnight windows like `22:00`–`06:00`):
+
+```python
+schedule.command("index:rebuild").every_thirty_minutes().unless_between("09:00", "17:00")
+```
+
+### Maintenance mode
+
+While the application is in maintenance mode (`./alata down`), scheduled events are skipped. Mark critical events to run anyway:
+
+```python
+schedule.command("backup:run").daily().even_in_maintenance_mode()
+```
+
+## Preventing overlaps
+
+By default a long-running event can overlap with its own next execution. `without_overlapping()` takes a lock in the [cache](/docs/digging-deeper/cache) before running and releases it afterwards:
+
+```python
+schedule.command("index:rebuild").every_five_minutes().without_overlapping()
+```
+
+The lock expires automatically after 24 hours as a safety net for crashed executions; tune it (in minutes) if your task can legitimately run longer:
+
+```python
+schedule.command("index:rebuild").every_five_minutes().without_overlapping(expires_after=10)
+```
+
+### Running on one server
+
+When the scheduler runs on multiple servers, every server would fire every event. `on_one_server()` makes servers race for an atomic cache lock — the first to acquire it runs the event, the rest skip it:
+
+```python
+schedule.job("reports:generate").daily_at("02:00").on_one_server()
+```
+
+The lock key is scoped to the current minute (with a TTL just over one cron cycle), so consecutive minutes use distinct keys and a lock claimed late in one minute can never starve the next minute's run.
+
+<Callout type="warn">
+Both `without_overlapping()` and `on_one_server()` are backed by the configured cache store — Redis by default. All servers must point at the **same** cache for the locks to mean anything.
+</Callout>
+
+## Hooks
+
+Attach callbacks around an event's execution:
+
+```python
+schedule.command("backup:run").daily() \
+    .before(lambda: notify("backup starting")) \
+    .after(lambda: notify("backup attempt finished")) \
+    .on_success(lambda: notify("backup ok")) \
+    .on_failure(lambda: notify("backup FAILED"))
+```
+
+`then()` is an alias for `after()`. Success and failure are decided by the event's exit code (`0` = success).
+
+The scheduler also fires framework [events](/docs/digging-deeper/events) for each execution: `ScheduledTaskStarting`, `ScheduledTaskFinished` (with duration), `ScheduledTaskSkipped` (with the reason), and `ScheduledTaskFailed` (with the exit code) — all importable from `alata.events.scheduling`. Listen to them for centralized monitoring.
+
+## Running the scheduler
+
+Add a single cron entry on your server that invokes `schedule:run` every minute:
+
+```bash
+* * * * * cd /path/to/project && ./alata schedule:run >> /dev/null 2>&1
+```
+
+Each invocation evaluates all registered events, executes the due ones (one-shot events run concurrently), and exits — unless sub-minute events are due, in which case it stays alive for the remainder of the minute.
+
+### Inspecting the schedule
+
+`schedule:list` prints every registered event with its cron expression, next due time, and constraints:
+
+```bash
+./alata schedule:list
+
+  Expression   Description                    Next Due (UTC)    Constraints
+  -----------  -----------------------------  ----------------  -----------
+  0 * * * *    ./alata queue:prune-orphans    2026-07-28 15:00  -
+  0 2 * * *    Job: reports:generate          2026-07-29 02:00  one-server
+```
+
+The constraints column flags `no-overlap`, `one-server`, and `tz:<zone>` so you can verify locking and timezone behavior at a glance.

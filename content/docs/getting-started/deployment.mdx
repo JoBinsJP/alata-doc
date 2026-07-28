@@ -1,0 +1,152 @@
+---
+title: Deployment
+description: Run Alata in production — ASGI server, queue workers, the scheduler, and maintenance mode.
+icon: Server
+---
+
+An Alata deployment is three long-running processes — the ASGI server, one or more queue workers, and a cron-driven scheduler — all loading the **same application kernel**. This page covers how to start each one, how to pin the framework version, and how the framework behaves once the environment is `production`.
+
+## One kernel, every process
+
+`bootstrap/application.py` builds the single `Application` for your project. Each entry point is a thin view over it:
+
+| Process | Entry point | Loads |
+| --- | --- | --- |
+| HTTP server | `uvicorn bootstrap.app:app` | `bootstrap/app.py` → `app = kernel.fastapi` |
+| Console | `./alata <command>` | `bootstrap/application.py` directly |
+| Queue worker | `taskiq worker bootstrap.broker:broker` | `bootstrap/broker.py` → `broker = app.make("queue.broker")` |
+
+Because the worker's `bootstrap/broker.py` imports the application, a taskiq worker starts with the full provider lifecycle already run — initialized database engines, redis clients, and every service you registered — with **no worker-specific boot code**. HTTP, console, and workers never run on different containers.
+
+## The ASGI server
+
+Point uvicorn at the ASGI entry point:
+
+```bash
+uvicorn bootstrap.app:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+`main:app` is an equivalent target (`main.py` re-exports the same instance). The scaffolded `Makefile` wraps this as:
+
+```bash
+make serve-prod   # uvicorn bootstrap.app:app --host 0.0.0.0 --port $(PORT)
+```
+
+You can also use the built-in serve command — reload is disabled automatically when `--workers` is greater than 1, or explicitly with `--no-reload`:
+
+```bash
+./alata serve --host 0.0.0.0 --port 8000 --workers 4 --no-reload
+```
+
+<Callout type="info">
+Behind a proxy or load balancer, add your public hostname to the `TRUSTED_HOSTS` env variable (comma-separated). Trusted-host enforcement switches on automatically when `ENVIRONMENT=production`; requests with unrecognized `Host` headers are rejected.
+</Callout>
+
+### Health probes
+
+Every Alata app exposes framework health routes — wire them into your orchestrator:
+
+- `GET /health` — liveness: the process is up.
+- `GET /health/db` — readiness: runs `SELECT 1` on every registered async connection; 200 if all pass, 503 otherwise.
+- `GET /health/metrics` — connection-pool utilization for dashboards and alerting.
+
+## Queue workers
+
+Start a worker with the console command:
+
+```bash
+./alata queue:work --queue high,default --workers 4
+```
+
+`--queue` takes a comma-separated priority list (leftmost is highest). Under the hood this runs the taskiq CLI, which you can invoke directly in a container entrypoint or process manager:
+
+```bash
+python -m taskiq worker bootstrap.broker:broker \
+  --fs-discover --tasks-pattern "app/tasks/*_tasks.py" \
+  --workers 4
+```
+
+Either way, the target is `bootstrap.broker:broker` — the broker resolved from your booted kernel. Run workers under a supervisor (systemd, or a container orchestrator with restart policies) so they come back after crashes and deploys. For a full dashboard and worker supervisor, see [Horizon](/docs/packages/horizon).
+
+## The scheduler
+
+Add a single cron entry on one machine (or a dedicated scheduler container) that ticks every minute:
+
+```bash
+* * * * * cd /path/to/app && ./alata schedule:run >> /dev/null 2>&1
+```
+
+`schedule:run` evaluates the schedule defined in `app/console/kernel.py` and fires whatever is due. Use `on_one_server()` on events if you run the cron entry on multiple machines — see [scheduling](/docs/digging-deeper/scheduling).
+
+## Pinning the framework version
+
+Alata installs from its Git repository. In production builds, pin an exact tag with a uv source so deploys are reproducible:
+
+```toml title="pyproject.toml"
+[project]
+dependencies = [
+    "alata",
+    "uvicorn>=0.40.0",
+]
+
+[tool.uv.sources]
+alata = { git = "ssh://git@github.com/JoBinsJP/alata-core.git", tag = "v0.3.1" }
+```
+
+Then `uv sync` in your build step produces the same framework version every time. Upgrading is a one-line tag bump. The repository is private — your build environment needs SSH access to it.
+
+## Production environment settings
+
+Set the environment explicitly:
+
+```bash title=".env (production)"
+APP_ENV=production
+ENVIRONMENT=production
+DEBUG=false
+```
+
+`APP_ENV` and `ENVIRONMENT` drive different checks — set both, as covered in [configuration](/docs/getting-started/configuration#app_env-vs-environment). You can also keep one `.env` and override per environment with a `.env.production` overlay, or force the environment per command with `./alata <command> --env production`.
+
+### The exception handler fails closed
+
+The central exception handler resolves the environment **once at boot** from the `settings` binding, and treats any `APP_ENV` starting with `prod` as production. In production it never leaks internals to clients:
+
+- `ValueError` renders as `400` with the generic message `"Invalid request."` instead of the raw exception text.
+- Database errors render as `500` with `"A database error occurred."` and `details: null`.
+- Unhandled exceptions render as a generic `500` — full tracebacks go to your [log channels](/docs/basics/logging) (file, JSON, Sentry), never to the response.
+
+<Callout type="warn">
+If the environment cannot be determined at all — unbooted container, missing settings — the handler **assumes production**. Failing closed means a misconfigured deployment hides error details rather than exposing them. If you see generic error messages in local development, check that `APP_ENV` is set.
+</Callout>
+
+Other behavior that shifts with the environment: strict database mode defaults to off in production (`EFFECTIVE_DB_STRICT_MODE`), trusted-host middleware turns on, and Sentry reporting activates when `SENTRY_ENABLED=true` and a DSN is set.
+
+## Maintenance mode
+
+Take the application offline during risky deploys or data migrations:
+
+```bash
+./alata down   # enter maintenance mode
+./alata up     # back to live
+```
+
+`down` creates a flag file at `storage/framework/down` (resolved through `base_path()`, so it works from any process on that machine). While the flag exists:
+
+- **HTTP** — `MaintenanceModeMiddleware` returns `503` for every request, except the configured bypass paths (`middleware.maintenance_mode.bypass_paths`, `/health` by default) so load-balancer probes keep passing.
+- **Scheduler** — due events are skipped, unless an event opts in with `.even_in_maintenance_mode()`.
+
+Both commands are idempotent — running `down` twice, or `up` when the app is already live, just prints a notice. The `APP_MAINTENANCE_MODE=true` setting is an env-driven alternative that blocks scheduled events without touching the filesystem (it does not affect HTTP).
+
+<Callout type="info">
+The flag file is per-filesystem. If you run multiple app servers, run `./alata down` on each host (or share `storage/` across them) — the HTTP 503 only applies where the flag exists.
+</Callout>
+
+## A minimal production checklist
+
+1. `APP_ENV=production`, `ENVIRONMENT=production`, `DEBUG=false` in the environment.
+2. Framework pinned to a tag via `[tool.uv.sources]`.
+3. `./alata migrate` run as a deploy step (check with `./alata migrate:status`).
+4. Uvicorn on `bootstrap.app:app` behind your load balancer, `TRUSTED_HOSTS` set.
+5. Workers on `bootstrap.broker:broker` under a supervisor.
+6. Cron entry for `./alata schedule:run` on exactly one node, or `on_one_server()` everywhere.
+7. Readiness probes on `/health/db`, liveness on `/health`.

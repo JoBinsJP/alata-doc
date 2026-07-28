@@ -1,0 +1,227 @@
+---
+title: Configuration
+description: Python config modules, typed pydantic settings, the config repository, and environment detection.
+icon: Settings
+---
+
+Alata configuration is plain Python. Each concern gets a module in `config/` — `database.py`, `queue.py`, `logging.py` — that builds a declarative dict from typed settings. At boot, before any service provider runs, the framework loads these modules into a central **config repository** with dot-notation access, and binds your typed **settings** object alongside it.
+
+## The two layers
+
+Configuration flows through two complementary layers:
+
+1. **`config/settings.py`** — a pydantic `BaseSettings` class. It reads `.env`, validates and casts every variable, and exposes typed attributes (`settings.DEBUG` is a real `bool`). This is the single source of truth for environment variables.
+2. **The other `config/` modules** — declarative dicts (`CONNECTIONS`, `QUEUE_CONFIG`, `LOG_CONFIG`, ...) built *from* settings. Providers read these through the config repository, never from the environment directly.
+
+This split keeps env parsing in one validated place while letting each subsystem's configuration stay structured and readable.
+
+```python title="config/database.py"
+from config.settings import settings
+
+# DB_CONNECTION selects the driver; "pgsql" is accepted as an alias for "postgres"
+_DRIVER = {"pgsql": "postgres"}.get(settings.DB_CONNECTION, settings.DB_CONNECTION)
+
+CONNECTIONS = {
+    "default": {
+        "driver": _DRIVER,
+        "host": settings.DB_HOST,
+        "port": settings.DB_PORT,
+        "database": settings.DB_DATABASE,
+        "username": settings.DB_USERNAME,
+        "password": settings.DB_PASSWORD,
+        "pool_size": 5,
+        "max_overflow": 10,
+        "pool_pre_ping": True,
+        "pool_recycle": 1800,
+        "echo": False,
+    },
+}
+```
+
+## The config repository
+
+During boot **Phase 0** — before any provider registers — the framework imports your `config` package and merges each module into a `ConfigRepository`, bound in the [service container](/docs/architecture/container) as `"config"`. Every value is then reachable with a dot-notation key:
+
+```python
+from alata.container import container
+
+config = container.make("config")
+
+config.get("database.connections.default.pool_size")  # 5
+config.get("cache.default")                           # "redis"
+config.get("queue.connections.redis.broker_url")      # "redis://localhost:6379/0"
+config.get("missing.key", "fallback")                 # "fallback"
+```
+
+The repository API is small:
+
+```python
+config.get(key, default=None)   # dot-notation lookup
+config.set(key, value)          # dot-notation write
+config.has(key)                 # key exists?
+config.all()                    # the entire nested dict
+config.merge(namespace, values) # register a top-level namespace (used at boot)
+config.flush()                  # clear everything (test isolation)
+```
+
+### The `config()` helper
+
+For quick reads anywhere in your code, `alata.config_repository` exports module-level helpers that resolve the repository from the current container:
+
+```python
+from alata.config_repository import config, config_set
+
+config("database.connections.default.pool_size")  # 5
+
+# Runtime override — primarily for tests:
+config_set("database.default", "sqlite")
+```
+
+<Callout type="info">
+If the container has not booted yet (for example during module-level imports), `config()` returns the default instead of raising — so it is safe in module scope, but the value will only be real after boot.
+</Callout>
+
+## Typed settings
+
+Your pydantic settings object is bound as `"settings"`:
+
+```python
+from alata.container import container
+
+settings = container.make("settings")
+
+settings.DEBUG            # bool
+settings.DB_HOST          # str
+settings.ENVIRONMENT      # "local" | "development" | "production"
+settings.is_production()  # helper method
+```
+
+You can also import it directly — `from config.settings import settings` — in application code; providers and framework code always go through the container binding.
+
+The template's `Settings` class ships helpers you will reach for often:
+
+```python
+settings.is_local()         # ENVIRONMENT == "local"
+settings.is_development()   # ENVIRONMENT == "development"
+settings.is_production()    # ENVIRONMENT == "production"
+settings.is_testing()       # True under pytest
+```
+
+Add your own variables by declaring typed fields on the class — pydantic handles parsing, casting, and defaults:
+
+```python title="config/settings.py"
+class Settings(BaseSettings):
+    # ...
+    STRIPE_API_KEY: str | None = None
+    FEATURE_NEW_BILLING: bool = False
+```
+
+## Config namespaces
+
+The loader (`alata.foundation.config_loader`) expects a fixed set of modules in your `config` package.
+
+### Required
+
+| Namespace | Module | Exported names | Repository shape |
+| --- | --- | --- | --- |
+| `database` | `config/database.py` | `CONNECTIONS`, `DB_CONFIG` | `database.connections.*`, `database.config.*` |
+| `redis` | `config/redis.py` | `CONNECTIONS` | `redis.connections.*` |
+| `cache` | `config/cache.py` | `CACHE_CONFIG` | `cache.*` |
+| `queue` | `config/queue.py` | `QUEUE_CONFIG` | `queue.*` |
+| `logging` | `config/logging.py` | `LOG_CONFIG` | `logging.*` |
+
+If any of these modules is missing, boot fails — the framework's base providers depend on them.
+
+### Optional
+
+| Namespace | Module | Exported names | Repository shape |
+| --- | --- | --- | --- |
+| `filesystem` | `config/filesystem.py` | `DISKS` | `filesystem.disks.*` |
+| `middleware` | `config/middleware.py` | `CORS`, `GZIP`, `TRUSTED_HOSTS`, `REQUEST_LOGGING`, `MAINTENANCE_MODE` | `middleware.cors`, `middleware.gzip`, `middleware.trusted_hosts`, `middleware.request_logging`, `middleware.maintenance_mode` |
+
+Optional modules are merged only when they exist; deleting `config/filesystem.py` simply leaves the `filesystem` namespace empty.
+
+<Callout type="warn">
+Framework code never imports `config.*` modules directly — everything goes through the `"config"` and `"settings"` bindings. Follow the same rule in providers: read from the repository, not from `os.environ`, so tests can override values with `config_set()`.
+</Callout>
+
+### Using a different package name
+
+The config package name is a kernel parameter (default `"config"`). Pass `config_module` when constructing the application to relocate it:
+
+```python title="bootstrap/application.py"
+app = Application(
+    base_path=Path(__file__).parent.parent,
+    config_module="settings_pkg",
+    providers=[...],
+)
+```
+
+## `.env` files and environment detection
+
+At construction, the kernel resolves the active environment and loads env files in a defined order:
+
+1. **`--env` CLI flag** — `./alata migrate --env production` sets `APP_ENV` and strips the flag before the command parser sees it.
+2. **pytest** — when running under pytest, the environment is forced to `testing`.
+3. **Explicit `env=` argument** to `Application(...)`.
+4. **`APP_ENV`** already present in the process environment.
+5. **`.env` in the project root** — loaded, then its `APP_ENV` is read. If no environment can be determined at all, boot raises.
+
+After resolution, the kernel loads `.env` (the base file) and then, if it exists, **`.env.{environment}`** as an overlay — so `.env.production` can override individual values from `.env` without duplicating the whole file.
+
+<Callout type="info">
+The template's `Settings` also loads `.env` from the **current working directory** — it deliberately never walks up into parent directories, so a stray `.env` outside your project can't leak configuration in. Run commands from the project root.
+</Callout>
+
+### `APP_ENV` vs `ENVIRONMENT`
+
+The template carries two related variables:
+
+- **`APP_ENV`** drives kernel environment resolution and the [exception handler's](/docs/basics/error-handling) production detection (any value starting with `prod` counts as production).
+- **`ENVIRONMENT`** (`local` | `development` | `production`) drives the settings helpers (`is_production()`), which gate things like trusted-host enforcement and strict database mode.
+
+Keep them consistent — in production, set both:
+
+```bash title=".env"
+APP_ENV=production
+ENVIRONMENT=production
+DEBUG=false
+```
+
+### The `env()` helper
+
+For one-off reads outside pydantic settings, `alata.foundation.environment` provides an `env()` helper with type inference:
+
+```python
+from alata.foundation.environment import env
+
+env("WORKER_COUNT", 4)      # "8" in the environment → int 8
+env("FEATURE_FLAG", False)  # "true" → True
+```
+
+## Maintenance mode configuration
+
+Two settings control [maintenance mode](/docs/getting-started/deployment#maintenance-mode) behavior:
+
+- **`APP_MAINTENANCE_MODE`** (settings, default `False`) — when `true`, the scheduler skips due events unless they are marked `even_in_maintenance_mode()`. The `storage/framework/down` flag file created by `./alata down` has the same effect, and additionally makes HTTP requests return 503.
+- **`middleware.maintenance_mode.bypass_paths`** (from `config/middleware.py`) — paths the 503 middleware lets through while the app is down. The template bypasses `/health` so load balancers keep probing:
+
+```python title="config/middleware.py"
+MAINTENANCE_MODE = {
+    "bypass_paths": ["/health"],
+}
+```
+
+## Overriding config in tests
+
+Because everything routes through the repository, tests can override values at runtime without touching env files:
+
+```python
+from alata.config_repository import config_set
+
+def test_uses_null_cache():
+    config_set("cache.default", "null")
+    ...
+```
+
+Pair it with `ConfigRepository.flush()` in teardown when a test needs a pristine repository.

@@ -1,0 +1,168 @@
+---
+title: Requests
+description: Validate incoming payloads with FormRequest, shape responses with FormResponse, and read request data anywhere.
+icon: Braces
+---
+
+Alata models every JSON payload as a typed class. `alata.http.request` provides two base classes — `FormRequest` for incoming bodies and `FormResponse` for outgoing ones — that wrap pydantic models with framework-level conveniences: automatic whitespace trimming, rejection of unknown fields, and helper methods for slicing validated data.
+
+## Form Requests
+
+Subclass `FormRequest` in `app/http/requests/` for every endpoint that accepts a JSON body. `Field` and `model_validator` are re-exported from `alata.http.request`, so your request files never import pydantic directly:
+
+```python title="app/http/requests/store_post_request.py"
+from alata.http.request import FormRequest, Field
+
+
+class StorePostRequest(FormRequest):
+    title: str = Field(..., min_length=1)
+    body: str = Field(...)
+```
+
+Type-hint a route handler with the class and validation happens before your code runs:
+
+```python title="routes/api.py"
+@api_router.post("/posts", status_code=201)
+async def store_post(request: StorePostRequest):
+    print(request.title)          # attribute access, fully typed
+```
+
+Two behaviours are built into every `FormRequest`:
+
+- **String trimming** — leading and trailing whitespace is stripped from every `str` field before validation (`str_strip_whitespace`).
+- **Unknown fields are rejected** — any JSON key the client sends that is not declared on the model triggers a 422 error (`extra: "forbid"`). This prevents mass-assignment style attacks by default.
+
+<Callout type="warn">
+Because extras are forbidden, adding a field to your API means adding it to the request class — a client sending an undeclared key gets a 422, not a silent drop. If a specific request must tolerate extra keys, override `model_config` on that subclass.
+</Callout>
+
+Validation failures never reach your handler. The central [exception handler](/docs/basics/error-handling) renders them as a structured 422 response:
+
+```json
+{
+  "error": "Unprocessable Entity",
+  "message": "The given data was invalid.",
+  "errors": { "title": "String should have at least 1 character" }
+}
+```
+
+### Retrieving Validated Input
+
+Every `FormRequest` carries three helpers for working with the validated data as plain dicts:
+
+```python
+data = request.validated()                    # all fields as a dict
+
+data = request.only("title", "body")          # just these keys
+
+data = request.except_("password_confirmation")  # everything but these
+```
+
+`validated()` is handy when passing the whole payload to a model or service; `only()` and `except_()` let you slice it without dict comprehensions in your handlers.
+
+### Cross-Field Validation
+
+Use the re-exported `model_validator` for rules that span multiple fields:
+
+```python title="app/http/requests/register_request.py"
+from alata.http.request import FormRequest, model_validator
+
+
+class RegisterRequest(FormRequest):
+    password: str
+    password_confirmation: str
+
+    @model_validator(mode="after")
+    def passwords_match(self):
+        if self.password != self.password_confirmation:
+            raise ValueError("Passwords do not match.")
+        return self
+```
+
+## Form Responses
+
+`FormResponse` is the mirror image for outgoing payloads. It enables `from_attributes`, so you can build a response directly from a database model instance, and ignores extra attributes — your model can carry more columns than the response exposes:
+
+```python title="app/http/requests/user_response.py"
+from alata.http.request import FormResponse
+
+
+class UserResponse(FormResponse):
+    id: int
+    name: str
+    email: str
+```
+
+```python title="routes/api.py"
+@api_router.get("/users/{user_id}", response_model=UserResponse)
+async def show_user(user_id: int):
+    user = await User.afind_or_fail(user_id)
+    return UserResponse.model_validate(user)
+```
+
+Declaring `response_model` also filters the OpenAPI schema, so `/docs` shows exactly what the endpoint returns.
+
+## Headers, Query Strings, and Client Info
+
+`FormRequest` covers the JSON body. For everything else about the incoming request — headers, cookies, the client address, the raw URL — type-hint the standard `Request` object in any handler:
+
+```python
+from fastapi import Request
+
+
+@api_router.get("/whoami")
+async def whoami(request: Request):
+    return {
+        "ip": request.client.host,
+        "user_agent": request.headers.get("User-Agent"),
+        "path": request.url.path,
+        "query": dict(request.query_params),
+    }
+```
+
+### Request State
+
+Middleware stores per-request values on `request.state`. Out of the box:
+
+- `request.state.request_id` — set by the request-logging [middleware](/docs/basics/middleware) (from the incoming `X-Request-ID` header, or generated), and echoed back on the response for tracing.
+- `request.state.user_id` — set by the scaffold's `IdentityMiddleware` from the `X-User-Id` / `X-Guest-Id` headers, falling back to `"anonymous"`.
+
+Prefer the dependencies in `app/http/dependencies.py` (`get_user_id`, `require_authenticated`) over reading `request.state` directly in handlers.
+
+## Request Context Outside the Request
+
+Services and actions often need to know *who* is acting without threading a request object through every call. `alata.context` provides async-safe, request-scoped context variables for exactly this:
+
+```python
+from alata.context import user_id_context, request_context
+```
+
+- `user_id_context: ContextVar[str | None]` — the acting user's id.
+- `request_context: ContextVar[dict | None]` — arbitrary per-request metadata.
+
+They default to `None`; your middleware populates them, and anything downstream can read them without an explicit parameter:
+
+```python title="app/http/middleware.py"
+from alata.context import user_id_context
+
+
+class IdentityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        user_id = request.headers.get("X-User-Id") or "anonymous"
+        request.state.user_id = user_id
+        user_id_context.set(user_id)
+        return await call_next(request)
+```
+
+```python title="app/services/audit.py"
+from alata.context import user_id_context
+
+
+def audit(action: str):
+    actor = user_id_context.get() or "system"
+    ...
+```
+
+<Callout type="info">
+The [exception handler](/docs/basics/error-handling) reads `user_id_context` automatically — when it is set, every reported exception includes the acting user's id in its log context. Because `ContextVar` is task-local, values never leak between concurrent requests.
+</Callout>

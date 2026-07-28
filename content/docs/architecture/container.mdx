@@ -1,0 +1,197 @@
+---
+title: Service Container
+description: Register and resolve your application's services with Alata's dependency injection container.
+icon: Box
+---
+
+The service container is the registry at the heart of every Alata application: providers bind services into it during boot, and the rest of your code resolves them by name. It keeps construction logic in one place, makes dependencies lazy by default, and lets tests swap implementations without patching imports.
+
+## The `container` handle
+
+Everywhere in your application, import the same handle:
+
+```python
+from alata.container import container
+
+config = container.make("config")
+log = container.make("log")
+```
+
+`container` is not a container instance — it is a *proxy* that delegates every attribute access, at call time, to the currently active container. When the `Application` kernel is constructed it promotes itself with `ServiceContainer.set_instance(self)`, and from that moment every holder of the proxy — including modules that imported it *before* the kernel existed — transparently talks to the kernel.
+
+This design has two practical consequences:
+
+- **Module-top imports are always safe.** You can write `from alata.container import container` at the top of any module without worrying about import order. There is no stale reference to a pre-boot container, ever.
+- **Tests can swap containers.** A test can construct a fresh `ServiceContainer` (or a whole `Application`) and promote it; all production code immediately resolves against the test's container, and restoring the previous instance puts everything back.
+
+```python
+from alata.container import ServiceContainer, container, current_container
+
+test_container = ServiceContainer()
+test_container.instance("mailer", FakeMailer())
+
+previous = ServiceContainer._instance
+ServiceContainer.set_instance(test_container)
+try:
+    # every `container.make("mailer")` in production code now returns FakeMailer
+    assert container.make("mailer") is test_container.make("mailer")
+finally:
+    ServiceContainer.set_instance(previous)
+```
+
+If you need the real object behind the proxy, `current_container()` returns it: the promoted `Application` when one exists, otherwise the process-wide base container.
+
+## Binding services
+
+Bindings are normally registered inside a [service provider's](/docs/architecture/providers) `register()` method. There are three binding styles.
+
+### Singletons
+
+`singleton(name, factory)` registers a *lazy* singleton: the factory runs once, on the first `make()`, and the result is cached for every subsequent call.
+
+```python
+container.singleton("mailer", lambda: Mailer(api_key=settings.MAIL_KEY))
+
+a = container.make("mailer")
+b = container.make("mailer")
+assert a is b  # factory ran exactly once
+```
+
+Resolution is thread-safe: FastAPI runs sync endpoints in a threadpool, and when two threads hit an unresolved singleton at the same moment, only one runs the factory — the other waits and reuses its result.
+
+Two sharp edges worth knowing:
+
+<Callout type="warn">
+A singleton factory that returns `None` is **not** cached — the factory is retried on the next `make()`. `None` usually means an external service was unavailable at first resolution (Redis down during boot, say); caching it would pin the process to the degraded state forever.
+</Callout>
+
+<Callout type="warn">
+You may pass arguments on a singleton's *first* resolution (`container.make("svc", val="configured")`), but passing arguments to an already-resolved singleton raises `ValueError` — silently ignoring them would make you believe you configured something you didn't.
+</Callout>
+
+### Factories
+
+`bind(name, factory)` registers a plain factory: it runs on *every* `make()`, returning a fresh instance each time.
+
+```python
+container.bind("report", lambda: ReportBuilder())
+
+a = container.make("report")
+b = container.make("report")
+assert a is not b  # new instance per call
+```
+
+### Instances
+
+`instance(name, value)` registers a pre-built value — an eager singleton. The framework uses this for Phase-0 bindings like `"config"` and `"settings"`, and providers use it when the object already exists at registration time.
+
+```python
+storage = Storage(app).set_configuration(disks)
+container.instance("storage", storage)
+```
+
+## Resolving services
+
+`make(name)` resolves a binding, checking in this order:
+
+1. Pre-built instances (from `instance()`)
+2. Lazy singletons (from `singleton()`, cached after the first call)
+3. Factories (from `bind()`, fresh each call)
+
+An unregistered name raises `KeyError`. Use `has(name)` to check first, and `registered()` to list every binding name:
+
+```python
+if container.has("cache"):
+    cache = container.make("cache")
+
+print(container.registered())  # ['cache', 'config', 'engine', 'events', ...]
+```
+
+### The registration guard
+
+During Phase 1 of the boot lifecycle — while providers are running `register()` — the container blocks resolution. Any `make()` call for a non-instance binding raises immediately:
+
+```
+RuntimeError: Cannot resolve 'cache' during Phase 1 (register).
+              Move resolution logic to a boot() method.
+```
+
+This enforces the provider contract: `register()` binds, `boot()` resolves. Pre-built instances are exempt because they are plain values that are always safe to read — which is exactly why Phase 0 binds `"config"` and `"settings"` as instances before any provider runs.
+
+## Type-based resolution and `@inject`
+
+Besides string names, the container can map classes to bindings for type-driven resolution:
+
+```python
+from alata.container import container, inject
+from alata.log_manager import LogManager
+
+# In a provider's register():
+container.bind_type(LogManager, "log")
+
+# Anywhere:
+log = container.resolve(LogManager)      # delegates to make("log")
+container.has_type(LogManager)           # True
+```
+
+The `@inject` decorator builds on the type map: it inspects a function's type hints and auto-fills any parameter whose annotated type is registered. Parameters you pass explicitly are never overridden, and both sync and async functions are supported.
+
+```python
+from alata.container import inject
+from alata.log_manager import LogManager
+
+@inject
+def handle_search(query: str, log: LogManager):
+    log.info(f"Searching for {query}")
+
+handle_search("python developer")  # 'log' is auto-injected
+```
+
+`resolve()` on an unmapped type raises `KeyError` telling you to call `bind_type()` first.
+
+## Resetting: `flush()`
+
+`flush()` wipes the container back to empty: all singleton, factory, and instance bindings, the type map, the booted flag, and the container's cached provider instances. It exists primarily for test isolation — the framework's own test suite uses a fixture that yields the container and flushes it afterwards so no binding leaks between tests:
+
+```python
+import pytest
+from alata.container import container
+
+@pytest.fixture
+def fresh_container():
+    yield container
+    container.flush()
+
+def test_my_service(fresh_container):
+    fresh_container.singleton("svc", lambda: MyService())
+    assert isinstance(fresh_container.make("svc"), MyService)
+```
+
+Flushing is instance-scoped: flushing one container never touches another container's bindings or provider cache, so parallel test containers stay independent.
+
+<Callout type="error">
+Never call `flush()` on the live container in production code — it unbinds everything the providers registered, and the application will start raising `KeyError` on the next resolution.
+</Callout>
+
+## Boot state
+
+Two small members round out the API. `container.booted` reports whether the provider boot cycle has completed, and `mark_booted()` sets it — the kernel calls this at the end of boot, and framework internals (such as the model event dispatcher) stay inert until it flips. `flush()` resets it to `False`. There is deliberately no public setter on `booted`.
+
+## API reference
+
+| Member | Description |
+| --- | --- |
+| `singleton(name, factory)` | Lazy singleton — factory runs once, result cached; thread-safe |
+| `bind(name, factory)` | Factory — runs on every `make()` |
+| `instance(name, value)` | Pre-built value (eager singleton) |
+| `make(name, *args, **kwargs)` | Resolve by name; instances → singletons → factories |
+| `has(name)` | Whether a binding exists under any style |
+| `registered()` | Sorted list of all binding names |
+| `bind_type(cls, name)` / `resolve(cls)` / `has_type(cls)` | Class-to-binding mapping for typed resolution |
+| `flush()` | Reset all bindings, the type map, boot flags, and the provider cache |
+| `booted` / `mark_booted()` | Boot-cycle state |
+| `ServiceContainer.set_instance(c)` / `get_instance()` | Promote / fetch the process's current container |
+| `current_container()` | The container the proxy currently targets |
+| `@inject` | Auto-fill parameters from type hints |
+
+To see who populates the container and when, continue with [service providers](/docs/architecture/providers) and the [application lifecycle](/docs/architecture/lifecycle).

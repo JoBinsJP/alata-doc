@@ -1,0 +1,12 @@
+{
+  "pages": [
+    "index",
+    "getting-started",
+    "architecture",
+    "basics",
+    "database",
+    "digging-deeper",
+    "testing",
+    "packages"
+  ]
+}

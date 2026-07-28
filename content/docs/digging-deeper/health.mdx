@@ -1,0 +1,81 @@
+---
+title: Health Checks
+description: Built-in liveness, readiness, and pool-metrics endpoints for load balancers and monitoring.
+icon: Heart
+---
+
+Every Alata application ships with health endpoints out of the box. The framework's health provider mounts them during HTTP boot — no route registration, no configuration. Point your load balancer, orchestrator, or monitoring system at them and you're done.
+
+## The endpoints
+
+### `GET /health` — liveness
+
+Answers immediately, with no external dependencies. If this responds, the process is alive:
+
+```json
+{"status": "ok"}
+```
+
+Use it as a liveness probe — it never touches the database, so a struggling dependency won't get your process restarted.
+
+### `GET /health/db` — readiness
+
+Runs a real `SELECT 1` against **every registered async database connection**. Returns `200` when all succeed:
+
+```json
+{"status": "ok", "connections": {"default": "ok"}}
+```
+
+If any connection fails — or no connections are registered at all — it returns `503` with the error per connection:
+
+```json
+{"status": "unavailable", "connections": {"default": "connection refused ..."}}
+```
+
+Binary pass/fail on purpose: this is the endpoint for Kubernetes readiness probes and load-balancer target checks, so a database outage takes the instance out of rotation.
+
+### `GET /health/metrics` — pool utilization
+
+Reports connection-pool numbers for every database connection, sync and async, for dashboards and alerting:
+
+```json
+{
+  "overall": "healthy",
+  "connections": {
+    "default": {
+      "sync": {"...": "..."},
+      "async": {"...": "..."}
+    }
+  }
+}
+```
+
+The `overall` status is driven by the **async** pools (the ones serving HTTP traffic); sync pool numbers are included as auxiliary information for CLI and worker observability:
+
+| Status | Condition |
+| --- | --- |
+| `healthy` | all async pools below 80% utilization |
+| `degraded` | any async pool at or above 80% |
+| `critical` | any async pool at or above 100% |
+
+## Customization
+
+The endpoints come from a regular [service provider](/docs/architecture/providers) — `alata.providers.health_provider` — listed in your project's `bootstrap/providers.py` under `FRAMEWORK_PROVIDERS`. Remove it from the list to drop the routes entirely, or add your own provider with a `boot_http(app)` hook to mount additional checks alongside them:
+
+```python title="app/providers/readiness_provider.py"
+from alata.support.service_provider import ServiceProvider
+
+
+class Provider(ServiceProvider):
+    def register(self) -> None:
+        pass
+
+    def boot_http(self, app) -> None:
+        @app.get("/health/queue")
+        async def health_queue() -> dict:
+            ...  # your check
+```
+
+<Callout type="info">
+The scaffolded `config/middleware.py` lists `/health` in the maintenance-mode `bypass_paths` — so load balancers keep getting a healthy liveness answer while the rest of the app returns `503` — and excludes it from request logging so probes don't flood your logs. If you rename or add probe endpoints, update both lists.
+</Callout>

@@ -1,0 +1,202 @@
+---
+title: Routing
+description: Define HTTP routes with standard ASGI decorators and organize them the Alata way.
+icon: Route
+---
+
+Alata's HTTP layer is FastAPI. Routes are plain `APIRouter` definitions — the same decorators, path parameters, and dependency system you may already know — and Alata adds the conventions around them: where route files live, how they are registered onto the one application kernel, and how routes reach services bound in the [service container](/docs/architecture/container).
+
+<Callout type="info">
+Route *syntax* on this page is standard ASGI/FastAPI. What is Alata-specific is the organization: `routes/` files, controller classes in `app/http/controllers/`, and registration through your app's HTTP provider during the [boot lifecycle](/docs/architecture/lifecycle).
+</Callout>
+
+## Where Routes Live
+
+A fresh application ships one route file, `routes/api.py`, containing a single top-level router:
+
+```python title="routes/api.py"
+from app.http.controllers.welcome_controller import WelcomeController
+from fastapi import APIRouter
+
+api_router = APIRouter(prefix="/api/v1")
+welcome_controller = WelcomeController()
+
+api_router.get("/")(welcome_controller.index)
+```
+
+Controllers are plain classes with async methods:
+
+```python title="app/http/controllers/welcome_controller.py"
+from fastapi import Request
+
+
+class WelcomeController:
+    async def index(self, request: Request):
+        return {"message": "Welcome to Alata Framework!"}
+```
+
+Registering a bound method with `api_router.get("/")(welcome_controller.index)` is equivalent to using the decorator form — it keeps handler logic in a controller class while the route file stays a thin, readable route table. Decorator-style function handlers work exactly the same way if you prefer them:
+
+```python title="routes/api.py"
+@api_router.get("/ping")
+async def ping():
+    return {"pong": True}
+```
+
+## How Routes Are Registered
+
+Routes are mounted onto the FastAPI kernel by your application's HTTP provider. The scaffolded app extends the framework's `FastapiProvider` and includes the router in `boot()`:
+
+```python title="app/providers/fastapi_provider.py"
+from alata.http import FastapiProvider as HttpProvider
+
+
+class FastapiProvider(HttpProvider):
+    def boot(self):
+        from routes.api import api_router
+
+        self.app.fastapi.include_router(api_router)
+```
+
+The chain from process start to a mounted route:
+
+1. `bootstrap/application.py` builds the `Application` kernel with your provider list (the app's `FastapiProvider` runs last).
+2. The framework's `FastapiProvider.register()` creates the `FastAPI` instance and attaches it via `self.app.use_fastapi(fastapi)`.
+3. Your `FastapiProvider.boot()` imports the route modules and calls `include_router`.
+4. `bootstrap/app.py` exposes `app = kernel.fastapi` for the ASGI server (`uvicorn main:app` or `./alata serve`).
+
+Because HTTP, console, and queue workers all load the same kernel, anything you bind in a provider is available to your route handlers no matter which entry point started the process.
+
+## Path Parameters
+
+Declare path parameters as typed function arguments — conversion and validation are automatic, and a mismatched type returns a 422 response:
+
+```python title="routes/api.py"
+@api_router.get("/orders/{order_id}")
+async def show_order(order_id: int):
+    return {"order_id": order_id}
+```
+
+Query parameters are any typed arguments *not* present in the path:
+
+```python
+@api_router.get("/orders")
+async def list_orders(status: str | None = None, page: int = 1):
+    ...
+```
+
+## Request Bodies
+
+Type-hint a handler parameter with a `FormRequest` subclass and the JSON body is parsed, validated, whitespace-trimmed, and hardened against unknown fields before your code runs:
+
+```python title="app/http/requests/store_order_request.py"
+from alata.http.request import FormRequest, Field
+
+
+class StoreOrderRequest(FormRequest):
+    product_id: int
+    quantity: int = Field(..., ge=1)
+```
+
+```python title="routes/api.py"
+@api_router.post("/orders", status_code=201)
+async def store_order(request: StoreOrderRequest):
+    data = request.validated()
+    ...
+```
+
+Invalid bodies never reach your handler — the [exception handler](/docs/basics/error-handling) renders a structured 422 response. See [Requests](/docs/basics/requests) for the full `FormRequest` / `FormResponse` API.
+
+## Injecting Services into Routes
+
+You have two complementary injection mechanisms.
+
+### Request-scoped values: `Depends`
+
+Use FastAPI dependencies for values derived from the current request. The scaffold ships two in `app/http/dependencies.py`:
+
+```python title="routes/api.py"
+from fastapi import Depends
+
+from app.http.dependencies import get_user_id, require_authenticated
+
+
+@api_router.get("/me")
+async def me(user_id: str = Depends(require_authenticated)):
+    return {"user_id": user_id}
+```
+
+`get_user_id` reads the acting user from `request.state` (set by the identity [middleware](/docs/basics/middleware)); `require_authenticated` raises a 401 when the caller is anonymous.
+
+### Application services: the container
+
+Services registered by [providers](/docs/architecture/providers) are resolved from the container. The `container` import is a proxy that always targets the current container, so it is safe to import at module level:
+
+```python title="app/http/controllers/report_controller.py"
+from alata.container import container
+
+
+class ReportController:
+    async def index(self):
+        cache = container.make("cache")
+        ...
+```
+
+Or let type hints do the work with `@inject`, for any class registered via `container.bind_type`:
+
+```python
+from alata.container import inject
+from alata.log_manager import LogManager
+
+
+@inject
+async def index(log: LogManager):
+    log.info("Building report")
+    ...
+```
+
+The two mechanisms compose: use `Depends` for per-request data, the container for long-lived services.
+
+## Grouping and Prefixes
+
+Group related routes into their own routers and compose them. Prefixes nest, and `tags` group the routes in the generated API docs:
+
+```python title="routes/orders.py"
+from fastapi import APIRouter
+
+orders_router = APIRouter(prefix="/orders", tags=["orders"])
+
+
+@orders_router.get("/")
+async def index():
+    ...
+```
+
+```python title="routes/api.py"
+from routes.orders import orders_router
+
+api_router = APIRouter(prefix="/api/v1")
+api_router.include_router(orders_router)   # served at /api/v1/orders
+```
+
+You can also apply a prefix at mount time — `include_router(admin_router, prefix="/admin")` — or attach shared guards to a whole group with router-level dependencies:
+
+```python
+from fastapi import APIRouter, Depends
+
+from app.http.dependencies import require_authenticated
+
+admin_router = APIRouter(prefix="/admin", dependencies=[Depends(require_authenticated)])
+```
+
+<Callout type="info">
+New route files are just modules — create `routes/orders.py`, then include its router either from `routes/api.py` or directly in your `FastapiProvider.boot()` with `self.app.fastapi.include_router(orders_router)`.
+</Callout>
+
+## Next Steps
+
+<Cards>
+  <Card title="Requests" href="/docs/basics/requests" description="Validate incoming payloads with FormRequest and shape responses with FormResponse." />
+  <Card title="Middleware" href="/docs/basics/middleware" description="Run code before and after every request." />
+  <Card title="Error Handling" href="/docs/basics/error-handling" description="Turn exceptions into clean HTTP responses." />
+</Cards>

@@ -1,0 +1,229 @@
+---
+title: Error Handling
+description: Raise HTTP-semantic exceptions from anywhere and let one central handler report and render them.
+icon: ShieldAlert
+---
+
+Alata splits error handling into two halves. Your domain code raises exceptions that *carry* HTTP semantics — without importing anything from the HTTP layer — and a single central `ExceptionHandler` decides how each exception is **reported** (logged) and **rendered** (turned into a JSON response). The result: services stay framework-free, and every error response in your app has the same shape.
+
+## HTTP Exceptions
+
+The `alata.exceptions` module provides a small family of exceptions, each pinned to a status code:
+
+```python
+from alata.exceptions import (
+    HttpError,             # base — any status, defaults to 500
+    AuthenticationError,   # 401
+    AuthorizationError,    # 403
+    NotFoundError,         # 404
+    UnprocessableError,    # 422
+)
+```
+
+Raise them anywhere — services, actions, model methods — and the central handler renders them with their declared status:
+
+```python title="app/services/order_service.py"
+from alata.exceptions import NotFoundError, AuthorizationError
+
+
+async def find_order(order_id: int, tenant_id: int) -> Order:
+    order = await Order.afind(order_id)
+    if not order:
+        raise NotFoundError(f"Order {order_id} not found")
+    if order.tenant_id != tenant_id:
+        raise AuthorizationError()
+    return order
+```
+
+The rendered response:
+
+```json
+{ "error": "Not Found", "message": "Order 1 not found" }
+```
+
+### Default Messages
+
+The message argument is optional. When omitted, the exception uses the standard phrase for its status code — `AuthorizationError()` renders `"Forbidden"`, `NotFoundError()` renders `"Not Found"`, and so on.
+
+### `abort()`
+
+For one-off statuses that don't deserve a subclass, `abort(status_code, message)` raises an `HttpError` in a single line:
+
+```python
+from alata.exceptions import abort
+
+if not order.is_editable:
+    abort(409, "Order has already shipped.")
+
+abort(403)   # message defaults to "Forbidden"
+```
+
+### Custom Exception Classes
+
+Subclass `HttpError` for reusable semantics of your own:
+
+```python title="app/exceptions/errors.py"
+from alata.exceptions import HttpError
+
+
+class PaymentRequiredError(HttpError):
+    status_code = 402
+```
+
+<Callout type="info">
+These exceptions deliberately avoid importing the HTTP engine, so it is safe to raise them from queue tasks, scheduled commands, and services shared across entry points. At the controller boundary, the engine's own `HTTPException` is also handled — both families render through the same handler.
+</Callout>
+
+## The Exception Handler
+
+`alata.exceptions.ExceptionHandler` is the central catch-all. Once bootstrapped onto the kernel, *every* unhandled exception flows through two steps:
+
+1. **`report(exc)`** — decide whether the exception is worth logging, and log it with context.
+2. **`render(request, exc)`** — map it to a `JSONResponse`.
+
+### Built-in Renderings
+
+Out of the box the handler knows how to render:
+
+| Exception | Response |
+| --- | --- |
+| `HttpError` and subclasses | Declared status, `{"error": <status phrase>, "message": ...}` |
+| `ModelNotFoundError` (query builder) | 404 with the exception message |
+| Validation errors (request body / query) | 422 with a field-keyed `errors` dict |
+| The HTTP engine's `HTTPException` | Its status and detail |
+| `ValueError` | 400 (deprecated mapping — prefer `abort(400, ...)`) |
+| `LazyLoadingViolationError` | 500 with a `[Strict Mode]` message |
+| Database driver errors | 500, `"A database error occurred."` |
+| Anything else | 500, `"An unexpected error occurred."` |
+
+Validation failures render with each error keyed by its field path:
+
+```json
+{
+  "error": "Unprocessable Entity",
+  "message": "The given data was invalid.",
+  "errors": { "items.0.quantity": "Input should be greater than or equal to 1" }
+}
+```
+
+### Production vs Local
+
+At construction the handler resolves the environment once from the container's `settings` binding (`APP_ENV`). In production, internals are hidden: database error details are omitted and raw `ValueError` messages are replaced with a generic `"Invalid request."`. In local development the real messages come through to speed up debugging.
+
+<Callout type="warn">
+The environment check **fails closed**. If the environment cannot be determined — unbooted container, missing setting, empty `APP_ENV` — the handler assumes production, so internal details are never leaked by accident. If you see generic errors locally, check that your `.env` sets `APP_ENV` and the app booted normally.
+</Callout>
+
+## Reporting
+
+`report()` logs exceptions through the [logging system](/docs/basics/logging), but only when they are worth reporting. `should_report(exc)` returns `False` for:
+
+- Validation errors (expected client mistakes — no tracebacks for 422s).
+- HTTP exceptions with a status below 500, including any `HttpError` under 500 — a `NotFoundError` is an expected outcome, not an incident.
+- Anything listed in the handler's `dont_report` class attribute.
+
+Everything else is logged at `ERROR` level with the full traceback (`exc_info`), so your file, JSON, and error-tracking channels capture the stack.
+
+### Adding Context
+
+Two sources of context are merged into every report.
+
+**Handler-wide context** — override `context()` on your handler to attach data to *every* report. The base implementation already includes the acting user's id whenever the `user_id_context` [context variable](/docs/basics/requests#request-context-outside-the-request) is set:
+
+```python title="app/exceptions/handler.py"
+def context(self) -> dict:
+    return {**super().context(), "region": current_region()}
+```
+
+**Per-exception context** — give any exception a `context` attribute (dict) or method (returning a dict) and the handler merges it in:
+
+```python
+class InventoryError(Exception):
+    def __init__(self, sku: str):
+        super().__init__(f"Inventory conflict for {sku}")
+        self.context = {"sku": sku}
+```
+
+The merged context is appended to the log message and attached to the record as structured `extra_data`, so the JSON log channel emits it as a machine-readable `extra` field:
+
+```
+[Unhandled Exception] Inventory conflict for SKU-42 | context: {'user_id': 'user-123', 'sku': 'SKU-42'}
+```
+
+## Customizing the Handler
+
+Every app ships its own subclass in `app/exceptions/handler.py`:
+
+```python title="app/exceptions/handler.py"
+from pydantic import ValidationError
+
+from alata.db.query_builder import ModelNotFoundError
+from alata.exceptions.handler import ExceptionHandler
+
+
+class Handler(ExceptionHandler):
+    dont_report = [
+        ModelNotFoundError,   # don't log expected client mistakes
+        ValidationError,
+    ]
+
+    def register(self):
+        # register renderable / reportable callbacks here
+        pass
+```
+
+### Custom Renderings
+
+Register a callback in `register()` with `self.renderable()`. The handler inspects the callback's **first parameter's type hint** to know which exception it maps — no explicit registration key needed:
+
+```python title="app/exceptions/handler.py"
+from fastapi.responses import JSONResponse
+
+from app.exceptions.errors import InvalidOrderError
+
+
+class Handler(ExceptionHandler):
+    def register(self):
+        def render_invalid_order(e: InvalidOrderError):
+            return JSONResponse(status_code=400, content={"message": str(e)})
+
+        self.renderable(render_invalid_order)
+```
+
+Callbacks may be sync or async, and may accept the request as a second parameter:
+
+```python
+def render_teapot(e: TeapotError, request):
+    return JSONResponse(status_code=418, content={"path": request.url.path})
+```
+
+Returning `None` from a render callback falls through to the built-in mappings.
+
+### Custom Reporting
+
+`self.reportable()` works the same way — type-hint dispatch on the first parameter — and runs *before* the default logging. Return exactly `False` to stop the chain and suppress the default log entry:
+
+```python
+def report_payment_failure(e: PaymentFailedError):
+    notify_finance_team(e)
+    return False   # handled — skip the generic error log
+
+self.reportable(report_payment_failure)
+```
+
+### Wiring the Handler onto the Kernel
+
+`bootstrap(app)` attaches the handler to the FastAPI kernel, taking over the default validation-error handling as well. Bootstrap your subclass where the kernel is assembled — the app's HTTP provider is the natural place:
+
+```python title="app/providers/fastapi_provider.py"
+from app.exceptions.handler import Handler
+
+
+class FastapiProvider(HttpProvider):
+    def register(self):
+        super().register()
+        Handler().bootstrap(self.app.fastapi)
+        # ... middleware ...
+```
+
+This is also the pattern used in isolation (for example, in tests): construct a handler, call `handler.bootstrap(fastapi_app)`, and every route on that app renders through it.

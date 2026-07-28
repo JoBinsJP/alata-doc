@@ -1,0 +1,712 @@
+---
+title: Models
+description: Active-record models with mass assignment, casts, relationships, lifecycle hooks, and soft deletes.
+icon: Boxes
+---
+
+Alata models give every database table a rich Python class. A model class is your query entry point (`User.where(...)`, `User.find(1)`) and each instance is a row you can mutate, save, serialize, and delete. Underneath, models compile to SQLAlchemy 2.0 core statements, and every operation has a sync and an async form.
+
+## Defining a Model
+
+Extend `Model`, set `__tablename__`, and declare your columns. Alata ships concise column helpers so definitions stay short:
+
+```python title="app/models/user.py"
+from alata.db import Model, pk, str_col, text_col, bool_col, int_col, json_col, dt_col
+
+class User(Model):
+    __tablename__ = "users"
+    __fillable__ = ["name", "email", "age", "bio"]
+
+    id     = pk()
+    name   = str_col()
+    email  = str_col(unique=True)
+    age    = int_col(nullable=True)
+    bio    = text_col()
+    active = bool_col(default=True)
+    meta   = json_col()
+```
+
+Table names are always explicit — set `__tablename__` on every model; nothing is derived from the class name.
+
+### Column helpers
+
+`alata.db` exports a shorthand factory for each common column type:
+
+| Helper | Column type | Notes |
+| --- | --- | --- |
+| `pk()` | `INTEGER` auto-increment primary key | |
+| `big_pk()` | `BIGINT` auto-increment primary key | |
+| `uuid_pk()` | `VARCHAR(36)` primary key | For UUID / ULID values you assign yourself |
+| `str_col(length=255, **kw)` | `VARCHAR` | Not nullable by default |
+| `text_col(**kw)` | `TEXT` | Nullable by default |
+| `int_col(**kw)` | `INTEGER` | |
+| `big_int_col(**kw)` | `BIGINT` | |
+| `small_int_col(**kw)` | `SMALLINT` | |
+| `bool_col(default=False, **kw)` | `BOOLEAN` | |
+| `float_col(**kw)` | `FLOAT` | |
+| `numeric_col(precision=10, scale=2, **kw)` | `NUMERIC` | |
+| `json_col(**kw)` | `JSON` (`JSONB` on PostgreSQL) | Nullable by default |
+| `dt_col(**kw)` | `TIMESTAMP WITH TIME ZONE` | Nullable by default |
+| `date_col(**kw)` | `DATE` | Nullable by default |
+
+Each helper accepts standard column keyword arguments — `nullable=True`, `unique=True`, `index=True`, `default=...`. For anything the helpers don't cover, the raw SQLAlchemy types (`Column`, `String`, `Integer`, `DateTime`, ...) are re-exported from `alata.db` too.
+
+### Class-level configuration
+
+Every knob a model understands is a class attribute:
+
+```python
+class Post(Model):
+    __tablename__   = "posts"
+    __connection__  = "default"            # named connection from config/database.py
+    __fillable__    = ["title", "body"]    # mass-assignable columns
+    __hidden__      = ["body"]             # stripped from to_dict()/to_json()
+    __visible__     = []                   # if set, ONLY these columns serialize
+    __appends__     = ["excerpt"]          # computed properties added to to_dict()
+    __casts__       = {"body": "json"}     # attribute casting
+    __relationships__ = {}                 # see Relationships below
+    __global_scopes__ = {}                 # see Global Scopes below
+```
+
+### Timestamps
+
+Every model automatically has `created_at` and `updated_at` columns. `created_at` is set when a row is inserted and `updated_at` refreshes on every update — you never manage them by hand. The [`timestamps()` blueprint method](/docs/database/migrations#timestamps-and-soft-deletes) creates the matching columns in your migrations.
+
+Timestamps are **always timezone-aware UTC datetimes**, on every supported database. The columns use a timezone-preserving type that adapts to the dialect: on PostgreSQL it is a native `TIMESTAMP WITH TIME ZONE`, passed through untouched; on MySQL — whose `DATETIME` discards timezone information — values are normalized to UTC before writing and re-tagged as UTC when read back, stored as `DATETIME(6)` so microsecond precision matches. Your application code never sees a naive datetime from a model timestamp, regardless of which database is behind it. The same type backs the `deleted_at` column used by [soft deletes](#soft-deletes) and the `dt_col()` helper.
+
+### Primary keys
+
+The primary key is whatever column you mark as primary (`pk()`, `big_pk()`, `uuid_pk()`, or `Column(..., primary_key=True)`). Methods like `find()` and `save()` discover the primary key from the column definition — composite keys resolve to the first primary key column.
+
+## Retrieving Models
+
+Model classes start queries directly. Any `where`-style class method returns a [query builder](/docs/database/query-builder) you can keep chaining:
+
+```python
+from app.models.user import User
+
+users  = User.all()                              # every row, as a Collection
+user   = User.find(1)                            # by primary key, or None
+users  = User.find_many([1, 2, 3])               # by several primary keys
+user   = User.find_or_fail(1)                    # raises ModelNotFoundError if missing
+user   = User.first_where("email", "a@b.com")    # shortcut for where(...).first()
+
+adults = User.where("age", ">=", 18).order_by("name").get()
+```
+
+`ModelNotFoundError` is importable from `alata.db`.
+
+The query starters available as class methods are `where`, `where_null`, `where_not_null`, `where_in`, `where_not_in`, `where_between`, `where_raw`, `has`, `where_has`, `with_`, `with_count`, and the `with_sum` / `with_max` / `with_min` / `with_avg` aggregate family. Everything else the [query builder](/docs/database/query-builder) offers — ordering, pagination, aggregates, `pluck`, locking — chains off those.
+
+### Async retrieval
+
+Every read and write has an async twin prefixed with `a`. Use them inside request handlers and other coroutine code:
+
+```python
+users = await User.aall()
+user  = await User.afind(1)
+user  = await User.afind_or_fail(1)
+user  = await User.afirst_where("email", "a@b.com")
+users = await User.where("active", True).aget()
+```
+
+### Chunking large tables
+
+Avoid loading a huge table into memory at once:
+
+```python
+def handle_batch(batch: list) -> None:
+    for user in batch:
+        ...
+
+User.chunk(500, handle_batch)          # batches of 500; return False to stop
+User.each(lambda u: ..., size=100)     # one record at a time, fetched in chunks
+for user in User.lazy(chunk_size=100): # generator over the whole table
+    ...
+```
+
+The async counterparts are `achunk`, `aeach`, and `alazy`.
+
+### Building instances from raw rows: hydrate
+
+`Model.hydrate()` turns raw row mappings — plain dicts, or rows from `DB.select()` — into model instances, with read casts (`__casts__`) applied. It runs no queries and fires no events; the instances are built directly from the data you give it:
+
+```python
+from alata.db import DB
+
+rows  = DB.select("SELECT * FROM users WHERE score > :s", {"s": 90})
+users = User.hydrate(rows)     # Collection[User], casts applied
+
+users[0].is_dirty()            # False — originals are snapshotted for dirty checking
+```
+
+Keys that match mapped columns become column attributes. Extra keys — computed columns from hand-written SQL — are attached as plain instance attributes:
+
+```python
+users = User.hydrate([{"id": 1, "name": "Ada", "email": "ada@example.com", "post_count": 7}])
+users[0].post_count   # 7
+```
+
+<Callout type="warn">
+`hydrate()` never filters the rows it is given — global scopes, **including soft-delete filtering**, are not applied. You composed the query; the instances reflect it exactly.
+</Callout>
+
+`hydrate()` is also what the query builder's [`from_statement()`](/docs/database/query-builder#dropping-to-sqlalchemy) uses to turn entity-shaped rows from hand-built SQLAlchemy statements back into models.
+
+## Creating and Updating
+
+### `create`
+
+`create()` inserts a row and returns a fully populated instance — including the database-assigned primary key:
+
+```python
+user = User.create({"name": "Alice", "email": "alice@example.com"})
+user.id  # populated
+
+user = await User.acreate({"name": "Alice", "email": "alice@example.com"})
+```
+
+### Mass assignment
+
+`create()`, `acreate()`, `insert()`, and `ainsert()` silently drop any key not listed in `__fillable__`. This protects you from a request payload writing to columns it shouldn't:
+
+```python
+class User(Model):
+    __fillable__ = ["name", "email"]
+
+user = User.create({"name": "Eve", "email": "eve@example.com", "is_admin": True})
+# "is_admin" was discarded — only name and email were inserted
+```
+
+<Callout type="warn">
+If `__fillable__` is empty (the default), **no filtering happens** — every key in the dict is written. Always declare `__fillable__` on models that accept user input.
+</Callout>
+
+Constructing an instance directly and calling `save()` bypasses the fillable filter entirely — you are assigning attributes yourself, so you are trusted:
+
+```python
+user = User(name="Bob", email="bob@example.com")
+user.save()          # INSERT — instance has no primary key yet
+
+user.name = "Robert"
+user.save()          # UPDATE — instance has a primary key
+await user.asave()   # async variant
+```
+
+### Bulk inserts and upserts
+
+```python
+User.insert([
+    {"name": "A", "email": "a@example.com"},
+    {"name": "B", "email": "b@example.com"},
+])  # single INSERT, no instances returned
+
+User.upsert(
+    rows=[{"email": "a@example.com", "name": "A2"}],
+    unique_by=["email"],
+    update_cols=["name"],
+)   # INSERT ... ON CONFLICT (email) DO UPDATE SET name
+```
+
+Async: `ainsert`, `aupsert`.
+
+### `first_or_create` and `update_or_create`
+
+```python
+# Return the matching row, or create it (search attrs + create attrs merged)
+tag = Tag.first_or_create({"name": "python"}, {"color": "blue"})
+
+# Update the matching row, or create it
+plan = Plan.update_or_create({"user_id": user.id}, {"tier": "pro"})
+```
+
+Both run the create inside a transaction and gracefully recover if a concurrent request wins the race on a unique constraint. Async: `afirst_or_create`, `aupdate_or_create`.
+
+### Updating via queries
+
+Bulk updates go through the query builder and return the affected row count:
+
+```python
+count = User.where("active", False).update({"active": True})
+count = await User.where("active", False).aupdate({"active": True})
+```
+
+## Deleting Models
+
+```python
+user = User.find(1)
+user.delete()          # deletes this row, returns True/False
+await user.adelete()
+
+User.where("active", False).delete()   # bulk delete via the query builder
+```
+
+`delete()` returns `False` when the instance has no primary key value or a `deleting` hook cancels the operation.
+
+## Inspecting Instances
+
+```python
+user = User.find(1)
+
+user.is_dirty()             # any attribute changed since load?
+user.is_dirty("name")       # specific attribute(s) changed?
+user.is_clean()
+user.get_original("name")   # value as loaded from the database
+
+fresh = user.fresh()        # re-fetch this row (returns a new instance)
+copy  = user.replicate()    # clone without the primary key — save() inserts a new row
+```
+
+Async: `afresh()`.
+
+## Attribute Casting
+
+`__casts__` converts between database values and Python types transparently — on read, and on write through `create`/`insert`:
+
+```python
+class Event(Model):
+    __tablename__ = "events"
+    __fillable__  = ["title", "payload", "started_at"]
+    __casts__     = {
+        "payload":    "json",
+        "started_at": "datetime",
+    }
+
+event = Event.create({"payload": {"kind": "signup"}, "started_at": "2026-07-28T10:00:00"})
+event.payload["kind"]        # "signup" — dict, not a string
+event.started_at.year        # 2026 — datetime, parsed from the ISO string
+```
+
+Supported cast types: `"json"` / `"list"` / `"dict"`, `"integer"` / `"int"`, `"float"`, `"boolean"` / `"bool"`, `"string"` / `"str"`, `"datetime"`, `"date"`.
+
+<Callout type="info">
+JSON casts are column-aware: on a native `JSON` column the dict/list is passed through untouched (what async drivers expect), while on a `TEXT` column it is serialized to a JSON string. You get the right behavior either way.
+</Callout>
+
+## Serialization
+
+`to_dict()` and `to_json()` turn an instance into plain data, honoring `__hidden__`, `__visible__`, and `__appends__`:
+
+```python
+class User(Model):
+    __tablename__ = "users"
+    __hidden__  = ["password_hash"]
+    __appends__ = ["display_name"]
+
+    @property
+    def display_name(self) -> str:
+        return self.name.title()
+
+user.to_dict()   # {"id": 1, "name": ..., "display_name": ...} — no password_hash
+user.to_json()   # JSON string; datetimes serialized as ISO-8601
+```
+
+- `__hidden__` — columns excluded from the output.
+- `__visible__` — when non-empty, an allowlist: only these columns appear.
+- `__appends__` — extra computed properties included in the output.
+
+Relation aggregates loaded via [`with_count()` and friends](#counting-related-rows-with_count) (e.g. `posts_count`) are included alongside the columns, subject to the same `__hidden__` / `__visible__` filtering.
+
+## Relationships
+
+Declare relationships in the `__relationships__` dict using the four relationship types from `alata.db`:
+
+```python
+from alata.db import Model, HasOne, HasMany, BelongsTo, BelongsToMany
+
+class User(Model):
+    __tablename__ = "users"
+    __relationships__ = {
+        "profile": HasOne("Profile", "user_id"),
+        "posts":   HasMany("Post", "user_id"),
+        "roles":   BelongsToMany("Role", "role_user", "user_id", "role_id"),
+    }
+
+class Post(Model):
+    __tablename__ = "posts"
+    __relationships__ = {
+        "user": BelongsTo("User", "user_id"),
+    }
+```
+
+The related model can be given as the class itself or as a string name (`"Post"`). String names are resolved lazily from the model registry on first use, so forward references and circular model imports just work.
+
+### Relationship types
+
+| Type | Signature | Meaning |
+| --- | --- | --- |
+| `HasOne(related, foreign_key, local_key="id")` | one child | `User` has one `Profile`; `profiles.user_id` points back |
+| `HasMany(related, foreign_key, local_key="id")` | many children | `User` has many `Post`s; returns a `Collection` |
+| `BelongsTo(related, foreign_key, local_key="id")` | inverse | `Post.user_id` points at `users.id`; `foreign_key` lives on **this** model |
+| `BelongsToMany(related, pivot_table, foreign_pivot_key, related_pivot_key, local_key="id", related_key="id")` | many-to-many | joined through a pivot table; returns a `Collection` |
+
+### Lazy loading
+
+Accessing a relationship attribute runs the query on first access and caches the result on the instance:
+
+```python
+user = User.find(1)
+user.posts      # SELECT ... WHERE user_id = 1  (first access)
+user.posts      # cached — no second query
+
+post = Post.find(1)
+post.user       # the owning User, or None
+```
+
+### Eager loading
+
+Loading a relationship inside a loop causes one query per row — the classic N+1 problem. `with_()` loads a relationship for a whole result set in one extra query:
+
+```python
+users = User.with_("posts", "profile").where("active", True).get()
+for user in users:
+    user.posts   # already loaded — zero extra queries
+```
+
+Nested relationships use dot notation, and eager loads work with async retrieval too:
+
+```python
+users = User.with_("posts.user").get()          # posts, and each post's user
+users = await User.with_("posts").aget()
+```
+
+Eager-loaded many-relationships are [`Collection`](/docs/digging-deeper/collections)s — the same type lazy access returns, so collection helpers chain no matter how the relation was loaded. A parent with no related rows gets an empty `Collection`, never `None` or a bare list.
+
+### Constrained eager loading
+
+`with_()` also accepts dict entries mapping a relation name to a callable. The callable receives the related model's query builder — already scoped to the parents — and can filter or order the eager sub-query:
+
+```python
+users = User.with_({"posts": lambda q: q.where("status", "published")}).get()
+users = User.with_({"posts": lambda q: q.latest()}, "profile").get()   # mix with plain names
+```
+
+For a dotted name, the constraint applies to the **final segment** — `{"posts.comments": cb}` constrains the comments query, not the posts query. Constrain both levels by keying each path: `with_({"posts": cb1, "posts.comments": cb2})`.
+
+<Callout type="warn">
+**`limit()` inside a constraint caps the whole eager query, not rows per parent.** The eager sub-query fetches related rows for *all* parents at once, so `with_({"posts": lambda q: q.latest().limit(3)})` returns three posts *total* across the whole result set — not three per user. For "one related row per parent", use [`latest_of_many()` / `oldest_of_many()`](#one-row-from-a-has-many-latest_of_many-and-oldest_of_many) instead.
+</Callout>
+
+### Loading relations after the fact
+
+Already fetched the models? `Collection.load()` batch-loads relations onto the results with the same one-query-per-relation machinery as `with_()`, and accepts the exact same entries — dotted names and constraint dicts included:
+
+```python
+users = User.where("active", True).get()
+
+users.load("posts", "profile")                                # one query per relation
+users.load({"posts": lambda q: q.where("status", "published")})
+
+if include_comments:
+    users.load_missing("posts.comments")                      # only loads what's absent
+```
+
+`load()` re-queries a relation even when it is already loaded (a refresh); `load_missing()` leaves models that already have the relation untouched and queries only the ones missing it. Both return the collection, and their async twins are `aload` / `aload_missing`. See the [Collections](/docs/digging-deeper/collections#relationship-loading-model-collections) reference.
+
+### Counting related rows: with_count
+
+`with_count()` loads a `{relation}_count` integer attribute onto each result — one grouped subquery per relation regardless of result size, no N+1, for every relationship type including many-to-many:
+
+```python
+users = User.with_count("posts").get()
+users[0].posts_count            # int — 0 when there are no posts
+
+posts = Post.with_count("user", "tags").get()   # several relations at once
+```
+
+Dict entries constrain what gets counted:
+
+```python
+users = User.with_count({"posts": lambda q: q.where("status", "published")}).get()
+```
+
+`with_sum`, `with_max`, `with_min`, and `with_avg` aggregate a related column the same way, loading a `{relation}_{fn}_{column}` attribute — an optional third argument adds a constraint callable:
+
+```python
+users = User.with_sum("orders", "amount").get()
+users[0].orders_sum_amount      # sum, or None when there are no related rows
+```
+
+Parents with no related rows get `0` for counts and `None` for the other aggregates (SQL aggregates over zero rows). The related model's global scopes — soft deletes included — apply, so excluded rows are never counted. Loaded aggregates appear in `to_dict()` / `to_json()` output, subject to the same `__hidden__` / `__visible__` filtering as columns. Nested (dotted) relation names are not supported for aggregates — eager-load the nested relation and aggregate on the related model instead.
+
+### One row from a has-many: latest_of_many and oldest_of_many
+
+A thread has many messages, but list screens usually want just the latest one per thread. `latest_of_many()` reduces a `HasMany` to a single-row relationship that behaves like a `HasOne`:
+
+```python
+class Thread(Model):
+    __tablename__ = "threads"
+    __relationships__ = {
+        "messages":       HasMany("Message", "thread_id"),
+        "latest_message": HasMany("Message", "thread_id").latest_of_many(),
+    }
+
+threads = Thread.with_("latest_message").get()   # ONE extra query for all threads
+for thread in threads:
+    thread.latest_message                        # newest Message, or None
+```
+
+Eager loading resolves every parent's row in a **single query** using a `row_number()` window partitioned by the foreign key — portable across PostgreSQL, MySQL 8.0+ (MariaDB 10.2+), and SQLite 3.25+. Lazy access (`thread.latest_message`) runs a plain `ORDER BY ... LIMIT 1` query instead.
+
+Both variants take the ordering column (default `"created_at"`); ties are broken by the primary key. `oldest_of_many()` is the mirror — the minimum instead of the maximum:
+
+```python
+"first_message": HasMany("Message", "thread_id").oldest_of_many(),
+"top_message":   HasMany("Message", "thread_id").latest_of_many("score"),
+```
+
+<Callout type="info">
+In a constrained eager load, an of-many relation accepts **filter** constraints only — ordering or `limit()` from the constraint are ignored, because the reduction defines its own ordering to pick each parent's single row.
+</Callout>
+
+### Working with pivot tables
+
+Many-to-many links live in the pivot table, and the pivot mutations live on the relationship — bound to an instance via `relation()`:
+
+```python
+user = User.find(1)
+
+user.relation("roles").attach(3)                       # link role 3
+user.relation("roles").attach([4, 5], {"level": 1})    # link several, with extra pivot values
+user.relation("roles").detach(3)                       # unlink role 3 — returns deleted count
+user.relation("roles").detach()                        # unlink everything
+```
+
+`sync()` makes the pivot rows match a list exactly — attaching what's missing, detaching what isn't listed — and reports what changed:
+
+```python
+changes = user.relation("roles").sync([1, 2, 3])
+# {"attached": [3], "detached": [7], "updated": []}
+
+user.relation("roles").sync([1, 2], detaching=False)   # attach-only, never detaches
+user.relation("roles").sync({1: {"level": 9}})         # dict form: id → extra pivot values
+```
+
+`toggle()` flips each id — attached ones are detached and vice versa — and `update_existing_pivot()` updates extra columns on one existing pivot row:
+
+```python
+user.relation("roles").toggle([2, 4])                            # {"attached": [...], "detached": [...]}
+user.relation("roles").update_existing_pivot(3, {"level": 2})    # returns updated row count
+```
+
+Every operation has an async twin: `aattach`, `adetach`, `atoggle`, `aupdate_existing_pivot` — and `async_` for `sync`, because the literal name `async` is a reserved word, so it takes a trailing underscore just like `with_`:
+
+```python
+await user.relation("roles").async_([1, 2, 3])
+```
+
+A few things to know:
+
+- `attach()` performs no existence check — attaching an already-attached id inserts a duplicate pivot row. Reach for `sync()` or `toggle()` when idempotency matters.
+- Pivot operations require a saved parent; on an instance without a primary-key value they raise `ValueError`.
+- `relation()` works on every relationship type as a fresh, uncached query path — `user.relation("posts").get()` always hits the database, in contrast to the cached attribute access `user.posts`.
+
+#### Extra pivot columns: with_pivot
+
+By default only the two pivot keys travel with the relationship. `with_pivot()` loads extra pivot-table columns and exposes them on each related model as a `pivot` dict:
+
+```python
+class User(Model):
+    __tablename__ = "users"
+    __relationships__ = {
+        "roles": BelongsToMany("Role", "role_user", "user_id", "role_id").with_pivot("level"),
+    }
+
+user.roles[0].pivot   # {"user_id": 1, "role_id": 3, "level": 2}
+```
+
+The `pivot` dict is populated on both lazy and eager loads. `with_pivot()` returns a modified copy of the relationship, so it composes at declaration time without mutating a shared definition.
+
+### Querying by relationship existence
+
+```python
+User.has("posts").get()                          # users with at least one post
+User.has("posts", ">=", 5).get()                 # users with five or more
+User.where_has("posts", lambda q: q.where("status", "published")).get()
+```
+
+### Strict mode
+
+In busy applications, an accidental lazy load inside a loop is an easy way to melt the database. Strict mode turns lazy loads into errors so N+1s surface in development instead of production:
+
+```python
+Model.should_be_strict(True)   # usually driven by DB_CONFIG["strict_mode"]
+
+user = User.find(1)
+user.posts   # raises LazyLoadingViolationError — use with_("posts") instead
+```
+
+The scaffolded `config/database.py` wires `DB_CONFIG["strict_mode"]` to a settings flag, so you can enable it per environment.
+
+## Query Scopes
+
+### Local scopes
+
+Package a reusable query constraint as a method with the `@scope` decorator. The method receives the model class and a fresh query builder, and becomes callable as a class method:
+
+```python
+from alata.db import Model, scope
+
+class Post(Model):
+    __tablename__ = "posts"
+
+    @scope
+    def published(cls, query):
+        return query.where("status", "published")
+
+Post.published().order_by("created_at", "desc").get()
+```
+
+<Callout type="info">
+Scope methods receive the model **class** as their first argument, not an instance — name the parameter `cls`. Scopes take no additional arguments; they are zero-argument query entry points.
+</Callout>
+
+### Global scopes
+
+A global scope applies to every query on the model automatically. Subclass `GlobalScope` and return a list of filter conditions:
+
+```python
+from alata.db import Model, GlobalScope
+
+class TenantScope(GlobalScope):
+    def apply(self, query, model_class):
+        return [model_class.tenant_id == current_tenant_id()]
+
+class Invoice(Model):
+    __tablename__ = "invoices"
+    __global_scopes__ = {"tenant": TenantScope()}
+```
+
+Bypass scopes per query on the query builder:
+
+```python
+Invoice.where("total", ">", 0).without_global_scope("tenant").get()
+Invoice.where("total", ">", 0).without_global_scopes().get()   # bypass ALL scopes
+```
+
+Global scopes declared on mixins and parent classes merge automatically — this is exactly how soft deletes work.
+
+## Lifecycle Events
+
+Models fire hooks around every write. Register them with the `@hook` decorator:
+
+```python
+from alata.db import Model, hook
+
+class User(Model):
+    __tablename__ = "users"
+
+    @hook("creating")
+    def set_defaults(self):
+        if not self.status:
+            self.status = "active"
+
+    @hook("deleted")
+    def cleanup(self):
+        ...
+```
+
+The eight events, in firing order:
+
+| Operation | Before | After |
+| --- | --- | --- |
+| Insert (`create` / `save` on new instance) | `creating`, `saving` | `created`, `saved` |
+| Update (`save` on existing instance) | `updating`, `saving` | `updated`, `saved` |
+| Delete (`delete`) | `deleting` | `deleted` |
+
+A **before** hook (`creating`, `updating`, `saving`, `deleting`) can cancel the operation by returning `False` — the write never reaches the database:
+
+```python
+@hook("deleting")
+def protect_admins(self):
+    if self.is_admin:
+        return False   # delete() returns False, row survives
+```
+
+Hooks are collected across the whole class hierarchy, so mixins can contribute hooks too.
+
+<Callout type="info">
+Bulk operations that skip instantiating models — `insert()`, `upsert()`, and query-builder `update()`/`delete()` — fire **no model events**: no hooks run and nothing is dispatched to the event bus. Hooks fire for `create()`, `save()`, and instance `delete()` (and their async variants).
+</Callout>
+
+### Quiet writes: skipping events on purpose
+
+For backfills, imports, and hooks that must persist their own model without re-triggering the event cycle, every instance write has a quiet variant. It behaves identically — casts, fillable filtering, soft deletes all apply — but no hooks run and nothing reaches the event bus:
+
+```python
+user = User.create_quietly({"name": "Imported", "email": "import@example.com"})
+
+user.name = "Renamed"
+user.save_quietly()
+
+user.delete_quietly()   # a soft-deletable model still soft-deletes — just silently
+```
+
+Async: `acreate_quietly`, `asave_quietly`, `adelete_quietly`.
+
+### Model events on the event bus
+
+After-events (`created`, `updated`, `saved`, `deleted`) additionally dispatch a `ModelEvent` through the application [event bus](/docs/digging-deeper/events), fire-and-forget on the running event loop. Listen for it to react to any model change in one place:
+
+```python
+from alata.events.model_event import ModelEvent
+
+# a ModelEvent carries:
+event.model        # the model instance
+event.event_name   # "created" | "updated" | "saved" | "deleted"
+event.model_class  # e.g. "User"
+event.table_name   # e.g. "users"
+```
+
+Dispatch is skipped silently when no event loop is running (for example inside sync CLI commands) or when the container isn't booted, and listener exceptions are routed to the logging system rather than swallowed.
+
+## Soft Deletes
+
+Add the `SoftDeletes` mixin **before** `Model` in the base-class list, and create a `deleted_at` column in your migration (the blueprint's [`soft_deletes()`](/docs/database/migrations#timestamps-and-soft-deletes) does it):
+
+```python
+from alata.db import Model, SoftDeletes
+
+class Post(SoftDeletes, Model):
+    __tablename__ = "posts"
+```
+
+Now `delete()` sets `deleted_at` instead of removing the row, and every query on the model automatically excludes trashed rows (via a built-in `soft_deletes` global scope):
+
+```python
+post.delete()                 # sets deleted_at — row remains in the table
+post.trashed                  # True
+
+Post.all()                    # trashed rows excluded automatically
+Post.where("id", post.id).with_trashed().first()   # include trashed
+Post.where_not_null("id").only_trashed().get()     # ONLY trashed
+```
+
+Restoring and permanently deleting:
+
+```python
+post.restore_instance()       # clears deleted_at on this instance
+post.force_delete()           # actually removes the row
+
+# via the query builder, in bulk:
+Post.where("user_id", 7).only_trashed().restore()      # returns affected count
+Post.where("user_id", 7).soft_delete()                 # bulk soft delete
+```
+
+Async variants exist throughout: `adelete`, `asoft_delete`, `arestore_instance`, `aforce_delete`, and `arestore` / `asoft_delete` on the query builder.
+
+<Callout type="warn">
+`with_trashed()` and `only_trashed()` live on the query builder, so chain them after a query starter such as `where(...)` or `where_not_null("id")` — they are not class methods on the model.
+</Callout>
+
+## Multiple Connections
+
+Point a model at any named connection from `config/database.py` with `__connection__`:
+
+```python
+class AuditLog(Model):
+    __tablename__ = "audit_logs"
+    __connection__ = "analytics"
+```
+
+All reads and writes for the model — sync and async — route through that connection. See [Getting Started](/docs/database/getting-started) for defining connections.

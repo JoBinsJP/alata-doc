@@ -1,0 +1,844 @@
+---
+title: Query Builder
+description: A fluent, chainable interface for reading and writing rows, with sync and async execution built in.
+icon: SquareTerminal
+---
+
+The query builder is how you talk to the database in Alata. You start a chain from a model class, stack constraints fluently, and finish with a terminal method that executes the query. Under the hood every chain compiles to a SQLAlchemy 2.0 statement, so you get real bind parameters, dialect-aware SQL, and the async engine for free.
+
+```python
+from app.models.user import User
+
+users = await User.where("active", True).order_by("created_at", "desc").limit(10).aget()
+```
+
+## Sync and async: one API, two prefixes
+
+Every terminal method comes in two flavors: a sync form for CLI commands, migrations, and workers, and an async form — same name with an `a` prefix — for HTTP endpoints and anything running on the event loop:
+
+```python
+user  = User.where("email", email).first()          # sync
+user  = await User.where("email", email).afirst()   # async
+```
+
+`get`/`aget`, `count`/`acount`, `update`/`aupdate`, `paginate`/`apaginate` — the pattern holds across the entire API. The chain-building methods (`where`, `order_by`, `limit`, …) are identical in both worlds; only the terminal call differs. Examples below use whichever form reads best — the other is always one prefix away.
+
+Chains are **immutable**: every builder method returns a new builder, so you can branch from a base query safely.
+
+```python
+base    = User.where("active", True)
+admins  = base.where("role", "admin").get()
+recent  = base.order_by("created_at", "desc").limit(5).get()   # base is unchanged
+```
+
+## Starting a query
+
+A chain starts from one of the model's query-starter class methods:
+
+- `Model.where(...)` and the `where_*` family (`where_null`, `where_not_null`, `where_in`, `where_not_in`, `where_between`, `where_raw`)
+- `Model.with_(...)` — start with eager loading
+- `Model.with_count(...)` and the `with_sum` / `with_max` / `with_min` / `with_avg` family — start with [relation aggregates](/docs/database/models#counting-related-rows-with_count)
+- `Model.has(...)` / `Model.where_has(...)` — start with a relationship-existence filter
+- `Model.query()` — a bare builder, for methods with no starter of their own (`select`, `join`, `distinct`, `union`, `from_statement`, `where_relation`, …)
+
+Once the chain is started, every builder method below is available. For table access without a model, see [raw table queries](#raw-table-queries-dbtable) at the end of this page.
+
+## Retrieving rows
+
+### All matching rows: get
+
+`get()` executes the query and returns a [Collection](/docs/digging-deeper/collections) of model instances (or of plain dicts when the query projects columns — see [selecting specific columns](#selecting-specific-columns)):
+
+```python
+posts = await Post.where("status", "published").aget()
+
+for post in posts:
+    print(post.title)
+```
+
+To fetch every row in the table, use the model shortcut `all()` / `aall()`:
+
+```python
+users = await User.aall()
+```
+
+### A single row: first, sole
+
+`first()` limits the query to one row and returns the instance or `None`:
+
+```python
+user = await User.where("email", email).afirst()
+if user is None:
+    ...
+```
+
+`first_or_fail()` raises `ModelNotFoundError` instead of returning `None` — useful when a missing row is an error:
+
+```python
+from alata.db import ModelNotFoundError
+
+user = await User.where("email", email).afirst_or_fail()
+```
+
+`sole()` asserts the query matches **exactly one** row — it raises `ModelNotFoundError` when there are zero matches *or* more than one:
+
+```python
+setting = await Setting.where("key", "billing.currency").asole()
+```
+
+### By primary key: find
+
+The model exposes primary-key lookups directly:
+
+```python
+user  = await User.afind(42)             # instance or None
+user  = await User.afind_or_fail(42)     # raises ModelNotFoundError if missing
+users = await User.afind_many([1, 2, 3]) # Collection
+```
+
+`find` resolves the model's actual primary-key column — it is not hardcoded to `id`. There is also `first_where`, a one-liner for the most common lookup:
+
+```python
+user = await User.afirst_where("email", email)   # == where("email", email).afirst()
+```
+
+### Single values: value and pluck
+
+`value()` returns one column from the first matching row:
+
+```python
+name = await User.where("id", 42).avalue("name")
+```
+
+`pluck()` returns a Collection of a single column across all matching rows — or a dict when you pass a second column to key by:
+
+```python
+emails = await User.where("active", True).apluck("email")
+# Collection(["a@example.com", "b@example.com", ...])
+
+names_by_id = await User.where("active", True).apluck("name", "id")
+# {1: "Alice", 2: "Bob", ...}
+```
+
+### Existence and counting
+
+```python
+if await User.where("email", email).aexists():
+    ...
+
+if await User.where("email", email).adoesnt_exist():
+    ...
+
+total = await Post.where("status", "published").acount()
+```
+
+`exists()` compiles to `SELECT EXISTS(SELECT 1 ... LIMIT 1)`, so the database stops at the first matching row instead of counting everything — always prefer it over `count() > 0` when you only need a yes/no answer.
+
+### Other aggregates
+
+`max`, `min`, `avg`, and `sum` each take a column and respect every accumulated constraint:
+
+```python
+q = Order.where("status", "paid")
+
+highest = await q.amax("total")
+lowest  = await q.amin("total")
+average = await q.aavg("total")
+revenue = await q.asum("total")
+```
+
+## Selecting specific columns
+
+By default a query selects the full row and hydrates complete model instances. `select()` switches the query into **row mode**: you name the columns, and results come back as plain dicts, still wrapped in a [Collection](/docs/digging-deeper/collections):
+
+```python
+rows = await User.where("age", ">", 18).select("id", "name as username").aget()
+# Collection([{"id": 7, "username": "Ada"}, ...])
+```
+
+Column strings support `"col"`, `"col as alias"`, and — after a [join](#joins) — `"table.col"`. In row mode, `first()` returns a dict (or `None`), and eager loading does not apply.
+
+`select_raw()` adds a raw SQL fragment to the projection and combines freely with `select()`. A trailing `as alias` names the result key:
+
+```python
+rows = User.where("active", True).select("name").select_raw("upper(name) as shout").get()
+# [{"name": "Ada", "shout": "ADA"}, ...]
+```
+
+<Callout type="info">
+**Why dicts instead of partial models?** A model instance with only some of its columns loaded is a trap — every missing attribute looks like real data. Alata refuses to hydrate incomplete instances: either you get the whole model (no `select()`), or you get honest dict rows. Model hydration is completely unaffected when `select()` is not used.
+</Callout>
+
+## Joins
+
+`join()` adds an `INNER JOIN` so you can filter, order, or project across another table. Pass a table name or a model class, then the two sides of the ON clause:
+
+```python
+authors = (
+    User.where("active", True)
+    .join("posts", "id", "=", "posts.user_id")
+    .where("posts.status", "published")
+    .get()
+)
+```
+
+After a join, `"table.col"` strings resolve across every joined table — in `where()`, `order_by()`, `select()`, `group_by()`, and `having()`. Plain column names keep resolving against the base model, and the ON clause accepts the same operators as `where()`.
+
+Without `select()`, a joined query still hydrates the **base model** — the results above are `User` instances; the join exists for filtering. Add `select()` to project columns from both sides:
+
+```python
+rows = (
+    User.where("active", True)
+    .join("posts", "id", "=", "posts.user_id")
+    .select("users.name", "posts.title")
+    .get()
+)
+```
+
+`left_join()` takes the same arguments and keeps base rows with no match (`LEFT OUTER JOIN`):
+
+```python
+users = User.where("active", True).left_join("posts", "id", "=", "posts.user_id").get()
+```
+
+`join_sub()` joins a **derived table** built from another builder. The subquery's filters compile into the derived table, which is joined under an alias — reference its columns as `"alias.col"`:
+
+```python
+published = Post.where("status", "published")
+
+users = (
+    User.where("active", True)
+    .join_sub(published, "pub", "id", "=", "pub.user_id")
+    .get()
+)
+```
+
+## Distinct
+
+`distinct()` de-duplicates result rows (`SELECT DISTINCT`) and is portable across databases:
+
+```python
+ages = User.where("active", True).select("age").distinct().order_by("age").get()
+```
+
+`distinct_on()` keeps one row per distinct combination of the given columns (`SELECT DISTINCT ON`). Order by the same leading columns to control which row wins per group:
+
+```python
+latest_per_thread = (
+    Message.where_not_null("thread_id")
+    .distinct_on("thread_id")
+    .order_by("thread_id")
+    .order_by("sent_at", "desc")
+    .get()
+)
+```
+
+<Callout type="warn">
+`distinct_on()` is PostgreSQL-only — on any other dialect the query raises `NotImplementedError` when it is built. Use `distinct()` for portable de-duplication. For the "one row per group" pattern on other databases, reach for [`latest_of_many()` / `oldest_of_many()`](/docs/database/models#one-row-from-a-has-many-latest_of_many-and-oldest_of_many) on a relationship, or a `row_number()` window query via [`from_statement()`](#dropping-to-sqlalchemy).
+</Callout>
+
+## Unions
+
+`union()` combines two builders and removes duplicate rows; `union_all()` keeps them:
+
+```python
+young = User.where("age", "<", 20)
+old   = User.where("age", ">", 60)
+
+users = young.union(old).order_by("age").get()
+```
+
+Both queries must produce the same shape — the same model, or row mode with matching columns. Ordering, `limit()`, and `offset()` on the *receiving* builder apply to the **combined** result; the other builder's ordering and limit are not carried over. In model mode the combined rows hydrate as usual; in row mode you get dicts:
+
+```python
+rows = (
+    User.where("age", "<", 20).select("id", "age")
+    .union_all(User.where("age", ">", 60).select("id", "age"))
+    .order_by("age")
+    .get()
+)
+```
+
+## Where clauses
+
+### Basic where
+
+`where()` takes two or three arguments. With two, the operator is `=`:
+
+```python
+User.where("name", "Alice")            # name = 'Alice'
+User.where("age", ">=", 18)            # age >= 18
+```
+
+Supported operators: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `like`, `ilike`, `not like`.
+
+```python
+User.where("email", "like", "%@example.com")
+User.where("name", "ilike", "ali%")        # case-insensitive (PostgreSQL)
+User.where("name", "not like", "test%")
+```
+
+Chained `where()` calls are combined with AND:
+
+```python
+User.where("active", True).where("age", ">=", 18).get()
+# WHERE active = true AND age >= 18
+```
+
+<Callout type="info">
+When strict mode is enabled (`DB_STRICT_MODE`), referencing a column that doesn't exist on the model raises immediately with the list of valid columns — instead of failing later at the database.
+</Callout>
+
+### or_where
+
+`or_where()` adds an OR branch:
+
+```python
+users = User.where("role", "admin").or_where("role", "owner").get()
+# WHERE role = 'admin' OR role = 'owner'
+```
+
+<Callout type="warn">
+**OR grouping semantics.** `or_where` always ORs against the *entire accumulated AND group*, not just the previous `where`:
+
+```python
+User.where("name", "mw").where("age", ">=", 20).or_where("name", "other").get()
+# WHERE (name = 'mw' AND age >= 20) OR name = 'other'
+```
+
+If you need `A AND (B OR C)`, wrap the OR pair in a closure — see nested wheres below.
+</Callout>
+
+### Nested wheres
+
+Both `where()` and `or_where()` accept a lambda that receives a fresh builder. The nested group is parenthesized as a unit:
+
+```python
+results = (
+    User.where("age", ">", 25)
+    .where(lambda q: q.where("name", "Alice").or_where("email", "like", "%@corp.com"))
+    .get()
+)
+# WHERE age > 25 AND (name = 'Alice' OR email LIKE '%@corp.com')
+```
+
+### Null, in, between, and column comparisons
+
+```python
+User.where_null("deleted_reason")                  # IS NULL
+User.where_not_null("email_verified_at")           # IS NOT NULL
+
+User.where_in("role", ["admin", "owner"])          # IN (...)
+User.where_not_in("status", ["banned", "spam"])    # NOT IN (...)
+
+Order.where_between("total", [100, 500])                        # BETWEEN 100 AND 500
+Order.where("status", "paid").where_not_between("total", [100, 500])  # NOT BETWEEN
+
+Task.where_not_null("id").where_column("updated_at", "created_at")    # compare two columns
+```
+
+<Callout type="info">
+`where`, `where_null`, `where_not_null`, `where_in`, `where_not_in`, `where_between`, and `where_raw` double as chain starters on the model class. The remaining builder methods (`where_not_between`, `where_column`, `or_where`, `when`, ordering, grouping, …) are available anywhere after the chain has started — including straight off `Model.query()`.
+</Callout>
+
+### Conditional clauses: when
+
+`when()` applies a constraint only if a condition is truthy — no need to break the chain into `if`/`else`:
+
+```python
+status = request.query_params.get("status")
+
+posts = await (
+    Post.where("author_id", author.id)
+    .when(status, lambda q: q.where("status", status))
+    .aget()
+)
+```
+
+### Raw where clauses
+
+`where_raw()` injects a raw SQL fragment with **named** bind parameters:
+
+```python
+users = await User.where_raw("score > :min", {"min": 80}).aget()
+users = await User.where_raw("LOWER(email) = :email", {"email": value.lower()}).aget()
+```
+
+Raw parameters thread through every terminal method — `get`, `count`, aggregates, `update`, `delete`, sync and async alike. All raw parameters on one query share a single namespace, so reusing a name across `where_raw()` calls raises `ValueError` rather than silently corrupting the earlier clause:
+
+```python
+q = (
+    User.where_raw("age > :min_age", {"min_age": 18})
+        .where_raw("score > :min_score", {"min_score": 80})   # distinct names — OK
+)
+```
+
+### Filtering by relationships: has and where_has
+
+`has()` keeps only rows that have at least one related record; an operator and count let you set a threshold:
+
+```python
+authors = User.has("posts").get()               # users with any post
+prolific = User.has("posts", ">=", 3).get()     # users with 3+ posts
+```
+
+`where_has()` adds constraints on the related rows via an EXISTS subquery:
+
+```python
+publishers = User.where_has("posts", lambda q: q.where("status", "published")).get()
+```
+
+For the common single-condition case, `where_relation()` is a compact shorthand — it takes the same 2- or 3-argument forms as `where()` and expands to `where_has(relation, lambda q: q.where(col, ...))`:
+
+```python
+publishers = User.where("active", True).where_relation("posts", "status", "published").get()
+popular    = User.where("active", True).where_relation("posts", "views", ">=", 100).get()
+```
+
+`where_relation` lives on the builder, so chain it after a query starter — `Model.query().where_relation(...)` works.
+
+### Correlated subqueries: where_exists
+
+When the correlation isn't a declared relationship, `where_exists()` filters with a correlated `EXISTS (SELECT 1 ...)` subquery built from another builder (or a callable that receives a fresh builder). The subquery reaches the outer query through `"table.col"` references — `where_column()` with dotted names expresses the correlation:
+
+```python
+published = Post.where("status", "published").where_column("posts.user_id", "users.id")
+
+authors = User.where("active", True).where_exists(published).get()
+# ... WHERE active AND EXISTS (
+#         SELECT 1 FROM posts
+#         WHERE status = 'published' AND posts.user_id = users.id)
+```
+
+`where_not_exists()` accepts the same argument and negates the check.
+
+### Subqueries in where_in
+
+`where_in()` and `where_not_in()` accept another builder in place of a value list, compiling to `WHERE col IN (SELECT ...)` — one round trip, no intermediate id list in Python. The inner query must project exactly **one** column with `select()`; anything else raises `ValueError`:
+
+```python
+author_ids = Post.where("status", "published").select("user_id")
+
+authors  = User.where("active", True).where_in("id", author_ids).get()
+lurkers  = User.where("active", True).where_not_in("id", author_ids).get()
+```
+
+## Ordering, grouping, limit and offset
+
+### Ordering
+
+```python
+User.where("active", True).order_by("name").get()            # ASC (default)
+User.where("active", True).order_by("created_at", "desc").get()
+```
+
+`latest()` and `oldest()` are shortcuts that default to `created_at`:
+
+```python
+Post.where("status", "published").latest().first()    # newest first
+Post.where("status", "published").oldest("id").get()
+```
+
+`in_random_order()` shuffles at the database level, and `order_by_raw()` accepts a raw SQL fragment:
+
+```python
+Quote.where_not_null("text").in_random_order().limit(1).first()
+Post.where("status", "published").order_by_raw("char_length(title) DESC").get()
+```
+
+### Grouping and having
+
+```python
+rows = (
+    Order.where("status", "paid")
+    .group_by("customer_id")
+    .having("customer_id", ">", 100)
+    .get()
+)
+```
+
+`having()` takes the same operators as `where()`. For aggregate conditions, `having_raw()` accepts a raw SQL fragment with named parameters — the bind namespace (and its name-collision guard) is shared with `where_raw()`:
+
+```python
+big_customers = (
+    Order.where("status", "paid")
+    .select("customer_id")
+    .select_raw("sum(total) as revenue")
+    .group_by("customer_id")
+    .having_raw("sum(total) > :min", {"min": 1000})
+    .get()
+)
+# [{"customer_id": 7, "revenue": 1520}, ...]
+```
+
+### Limit and offset
+
+```python
+User.where("active", True).order_by("id").limit(20).offset(40).get()
+```
+
+## Pagination
+
+`paginate()` / `apaginate()` runs a count plus a page query and returns a plain dict:
+
+```python
+page = await Post.where("status", "published").order_by("id").apaginate(per_page=15, page=2)
+
+page["data"]           # Collection of model instances for this page
+page["total"]          # total matching rows
+page["per_page"]       # 15
+page["current_page"]   # 2
+page["last_page"]      # total pages (always >= 1)
+```
+
+Because it is a plain dict, it serializes straight into a JSON response.
+
+### Grouped counts
+
+`count()` — and therefore `paginate()` totals — understands grouping. On a grouped query, the count is the number of **groups** that survive `GROUP BY` / `HAVING`, not the raw row count:
+
+```python
+distinct_ages = User.where("active", True).group_by("age").count()
+# SELECT count(*) FROM (SELECT age ... GROUP BY age) — number of groups
+
+surviving = User.where("active", True).group_by("age").having("age", ">", 25).count()
+# only groups passing HAVING are counted
+```
+
+### Cursor pagination
+
+Offset pagination degrades on big tables: page N forces the database to scan and discard everything before it. `cursor_paginate()` / `acursor_paginate()` paginates by **keyset** over the query's `order_by()` columns instead — each page filters on the previous page's boundary values, so page 500 costs the same as page 1:
+
+```python
+page = await Post.where("status", "published").order_by("id").acursor_paginate(per_page=15)
+
+page["data"]          # Collection of model instances for this page
+page["per_page"]      # 15
+page["next_cursor"]   # opaque string, or None on the last page
+page["prev_cursor"]   # opaque string, or None on the first page
+```
+
+Pass a returned cursor back in to fetch the adjacent page — `next_cursor` pages forward, `prev_cursor` pages backward:
+
+```python
+page2 = await (
+    Post.where("status", "published")
+    .order_by("id")
+    .acursor_paginate(per_page=15, cursor=page["next_cursor"])
+)
+```
+
+Cursors are opaque URL-safe strings encoding the boundary row's ordering values, so they drop straight into a query parameter. A malformed cursor raises `ValueError`.
+
+A few rules:
+
+- With no `order_by()` on the query, rows are ordered by the primary key ascending automatically.
+- The ordering should uniquely identify rows — include the primary key as a tie-breaker (`.order_by("created_at", "desc").order_by("id", "desc")`), or ties across a page boundary may be skipped.
+- All ordering must come from `order_by()` columns; `order_by_raw()` and `in_random_order()` raise `ValueError`.
+- There is no `total` key — computing it would require the full count that keyset pagination exists to avoid. Use `paginate()` when you need page numbers.
+
+Cursor pagination works in [row mode](#selecting-specific-columns) too — after `select()`, `page["data"]` holds dicts.
+
+### Keyset iteration for large tables
+
+For iteration-style workloads (backfills, exports), the `*_by_id` chunking methods below apply the same keyset idea internally — they walk the table with `WHERE id > last_seen` instead of `OFFSET`, keeping total work linear.
+
+## Chunking and lazy iteration
+
+### chunk and chunk_by_id
+
+`chunk()` processes results in batches so you never hold the full result set in memory. The callback receives a list of instances; return `False` to stop early. It returns `True` when every chunk was processed, `False` if stopped early:
+
+```python
+def index_batch(users):
+    search.index(users)
+
+User.where("active", True).chunk(500, index_batch)
+```
+
+<Callout type="warn">
+`chunk()` paginates via SQL `OFFSET`, which makes total work O(n²) on large tables. Past roughly 100k rows, use `chunk_by_id()` — it walks the table with an indexed keyset cursor and stays O(n).
+</Callout>
+
+```python
+User.where("active", True).chunk_by_id(500, index_batch)          # cursor on "id"
+Event.where("kind", "click").chunk_by_id(1000, handle, column="event_id")
+```
+
+The async forms take a coroutine callback:
+
+```python
+async def index_batch(users):
+    await search.aindex(users)
+
+await User.where("active", True).achunk_by_id(500, index_batch)
+```
+
+### each
+
+`each()` wraps `chunk()` to hand you one instance at a time; return `False` to stop:
+
+```python
+User.where("active", True).each(lambda user: mailer.queue(user))
+await User.where("active", True).aeach(notify_user, size=200)
+```
+
+### lazy and lazy_by_id
+
+`lazy()` returns a generator that yields instances chunk by chunk — iterate a huge table with a plain `for` loop:
+
+```python
+for user in User.where("active", True).lazy(chunk_size=500):
+    process(user)
+```
+
+Like `chunk()`, `lazy()` uses OFFSET under the hood; prefer `lazy_by_id()` for large tables. The async variants are async generators:
+
+```python
+async for user in User.where("active", True).alazy_by_id(500):
+    await process(user)
+```
+
+## Inserting rows
+
+Creation goes through the model. `create()` inserts one row and returns the instance with its primary key populated; `insert()` bulk-inserts without building instances:
+
+```python
+user = await User.acreate({"name": "Alice", "email": "alice@example.com"})
+user.id   # populated
+
+await User.ainsert([
+    {"name": "Bob",   "email": "bob@example.com"},
+    {"name": "Carol", "email": "carol@example.com"},
+])
+```
+
+`first_or_create()` and `update_or_create()` handle find-or-insert flows atomically — see [Models](/docs/database/models) for those and for mass-assignment (`__fillable__`) rules that apply to all creation paths.
+
+## Updating rows
+
+`update()` applies a dict of changes to every row matched by the accumulated constraints and returns the affected count:
+
+```python
+count = await User.where("email", email).aupdate({"name": "New Name"})
+```
+
+If the model has an `updated_at` column, it is touched automatically on every builder update (unless you set it explicitly). Model-level casts (`__casts__`) are applied to the values.
+
+<Callout type="warn">
+Updates and deletes honor the **full** WHERE composition — including `or_where`. A mutation targets exactly the rows the equivalent `get()` would return:
+
+```python
+User.where("name", "A").or_where("name", "B").update({"age": 99})
+# updates rows matching name = 'A' OR name = 'B'
+```
+
+Also note: a builder update with **no** where clause updates every row in the table.
+</Callout>
+
+### Increment and decrement
+
+```python
+await Post.where("id", post_id).aincrement("views")          # +1
+await User.where("id", user_id).aincrement("credits", 50)    # +50
+await User.where("id", user_id).adecrement("credits", 10)    # -10
+```
+
+## Deleting rows
+
+`delete()` hard-deletes matching rows and returns the affected count:
+
+```python
+count = await Session.where("expired_at", "<", now).adelete()
+```
+
+Like `update()`, `delete()` honors `or_where`, and a delete with no constraints removes every row.
+
+### Soft deletes
+
+On models using soft deletes, the builder offers:
+
+```python
+await Post.where("id", post.id).asoft_delete()   # sets deleted_at — row hidden from queries
+await Post.where("id", post.id).with_trashed().arestore()  # sets deleted_at back to NULL
+
+Post.where("user_id", uid).with_trashed().get()  # include soft-deleted rows
+Post.where("user_id", uid).only_trashed().get()  # ONLY soft-deleted rows
+```
+
+Soft-deleted rows are excluded from every query automatically via a global scope — see [Models](/docs/database/models) for the full soft-delete lifecycle.
+
+### Global scopes
+
+Any named global scope can be bypassed per query:
+
+```python
+Invoice.where("total", ">", 0).without_global_scope("tenant").get()
+Invoice.where("total", ">", 0).without_global_scopes().get()   # bypass ALL scopes
+```
+
+## Upserts
+
+`upsert()` inserts multiple rows and updates the ones that collide on a unique constraint — one statement, no read-modify-write race:
+
+```python
+await Flight.aupsert(
+    [
+        {"departure": "Oakland", "destination": "San Diego", "price": 99},
+        {"departure": "Chicago", "destination": "New York",  "price": 150},
+    ],
+    unique_by=["departure", "destination"],   # conflict target
+    update_cols=["price"],                    # columns to overwrite on conflict
+)
+```
+
+If `update_cols` is omitted, every column except the `unique_by` columns is updated. On PostgreSQL and SQLite this compiles to `ON CONFLICT (...) DO UPDATE`; on MySQL to `ON DUPLICATE KEY UPDATE`.
+
+<Callout type="info">
+On MySQL, `unique_by` is accepted for API consistency but not used to target a specific constraint — MySQL fires the update on *any* unique-key violation.
+</Callout>
+
+## Pessimistic locking
+
+Inside a transaction, lock the selected rows:
+
+```python
+from alata.db import DB
+
+with DB.transaction():
+    account = Account.where("id", account_id).lock_for_update().first()  # SELECT ... FOR UPDATE
+    account.balance -= amount
+    account.save()
+```
+
+`lock_for_update()` accepts two options: `skip_locked=True` skips rows another transaction has already locked (`SKIP LOCKED` — the standard pattern for pulling work from a job table without contention), and `nowait=True` raises immediately instead of waiting on a conflicting lock (`NOWAIT`):
+
+```python
+job = Job.where("status", "pending").order_by("id").lock_for_update(skip_locked=True).first()
+```
+
+`shared_lock()` takes a shared lock instead (`SELECT ... FOR SHARE`), blocking writers but not other readers; it accepts the same `skip_locked` / `nowait` options.
+
+<Callout type="info">
+The `skip_locked` and `nowait` options require PostgreSQL or MySQL 8.0+ — earlier MySQL versions accept `FOR UPDATE` but not the `SKIP LOCKED` / `NOWAIT` modifiers.
+</Callout>
+
+## Eager loading
+
+`with_()` loads relationships alongside the main query, avoiding N+1 patterns. Dotted paths load nested relations:
+
+```python
+posts = await Post.with_("author", "comments.author").where("status", "published").aget()
+
+for post in posts:
+    post.author          # already loaded — no extra query
+```
+
+`with_()` also accepts `{relation: callable}` entries that constrain the eager sub-query, and the `with_count()` / `with_sum()` family loads relation aggregates without N+1. Relationships and eager-loading details — including those forms — live on the [Models](/docs/database/models) page.
+
+## Debugging queries
+
+### to_sql and get_bindings
+
+`to_sql()` returns the compiled SQL with literal values inlined — copy-paste-runnable in `psql`. `get_bindings()` returns the bind values as a dict:
+
+```python
+q = User.where("age", ">", 18).order_by("name")
+
+print(q.to_sql())
+# SELECT users.id, users.name, ... FROM users WHERE users.age > 18 ORDER BY users.name ASC
+
+print(q.get_bindings())
+# {"age_1": 18}
+```
+
+### dump and dd
+
+`dump()` pretty-prints the SQL and bindings to the console and returns the builder, so you can drop it mid-chain. `dd()` does the same, then exits the process:
+
+```python
+User.where("active", True).dump().where("age", ">", 18).get()   # prints, keeps going
+User.where("active", True).dd()                                 # prints and exits
+```
+
+### explain
+
+`explain()` runs the query through the database's `EXPLAIN` and returns the plan rows as dicts — bind parameters (including `where_raw()` params) are passed to the driver normally:
+
+```python
+plan = User.where("email", "like", "%@example.com").explain()
+for row in plan:
+    print(row)
+# {'QUERY PLAN': 'Seq Scan on users  (cost=0.00..1.14 rows=1 width=244) ...'}
+```
+
+If a sequential scan shows up where you expected an index, you know before production does.
+
+## Dropping to SQLAlchemy
+
+The builder covers the common ninety-five percent. For the rest — window functions, recursive CTEs, lateral joins — you don't leave the framework: compose the statement with SQLAlchemy Core and run it through `from_statement()`. This is the blessed path beyond the builder, not a workaround.
+
+```python
+import sqlalchemy as sa
+from app.models.user import User
+
+users_t = User.__table__   # every model exposes its SQLAlchemy Table
+
+ranked = sa.select(
+    users_t,
+    sa.func.rank().over(order_by=users_t.c.age.desc()).label("age_rank"),
+).where(users_t.c.active.is_(True))
+
+users = User.query().from_statement(ranked).get()
+users[0].age_rank   # extra columns ride along as plain attributes
+```
+
+The statement executes on the framework's session for the builder's connection — same engine, same pool, same ambient transaction — and results come back in the most useful shape:
+
+- An ORM-enabled statement (`sa.select(User)`) hydrates model instances directly.
+- Rows containing **every** model column hydrate through [`Model.hydrate()`](/docs/database/models#building-instances-from-raw-rows-hydrate) — real instances with read casts applied, plus any extra columns as plain attributes.
+- Anything else (partial projections, aggregates) returns dict rows.
+
+`Model.query()` hands you a bare builder — the entry point for any builder method that has no classmethod starter of its own (`select()`, `join()`, `distinct()`, `union()`, `from_statement()`). All the usual terminals work — `get`/`aget`, `first`/`afirst`.
+
+<Callout type="warn">
+The statement runs exactly as written: global scopes (including soft-delete filtering) are **not** applied, and no model events fire. `from_statement()` also replaces the composed query entirely — any `where()` / `order_by()` already on the builder is ignored.
+</Callout>
+
+When even a hand-built statement isn't enough, take the session itself — `get_session()` / `get_async_session()` and the session yielded by `DB.transaction()` are covered under [SQLAlchemy access](/docs/database/getting-started#beyond-the-builder-sqlalchemy-access) on the Getting Started page.
+
+## Raw table queries: DB.table()
+
+For tables without a model — pivot tables, one-off admin queries, data fixes — `DB.table()` gives you a compact builder that returns plain dicts instead of model instances:
+
+```python
+from alata.db import DB
+
+rows = DB.table("users").where("age", ">", 18).order_by("name").get()
+# [{"id": 1, "name": "Alice", ...}, ...]
+
+row = await DB.table("users").where("email", email).afirst()   # dict or None
+n   = await DB.table("users").where_in("role", ["admin"]).acount()
+```
+
+Its surface is a focused subset of the model builder:
+
+- **Wheres** — `where(col, val)` / `where(col, op, val)` (operators: `=`, `!=`, `<>`, `>`, `<`, `>=`, `<=`, `like`, `ilike`), `where_in`, `where_null`, `where_not_null`. Conditions combine with AND.
+- **Select** — `select("id", "name")` to pick columns, `select_raw("count(*) AS n")` for raw expressions.
+- **Shaping** — `order_by(col, direction)`, `limit(n)`, `offset(n)`.
+- **Reads** — `get`, `first`, `count` (async: `aget`, `afirst`, `acount`).
+- **Writes** — `insert(dict)`, `update(dict)`, `delete()` (async: `ainsert`, `aupdate`, `adelete`). `update` and `delete` return affected row counts and honor the accumulated wheres.
+
+```python
+DB.table("role_user").insert({"role_id": 1, "user_id": 42})
+DB.table("users").where("id", 42).update({"name": "Renamed"})
+DB.table("sessions").where("expired_at", "<", now).delete()
+
+totals = DB.table("orders").select_raw("customer_id, sum(total) AS revenue").get()
+```
+
+Table and column names are validated and quoted with the connection's dialect rules, and all values travel as bind parameters. Scope it to a named connection with `DB.connection("reporting").table("sales")`.
+
+<Callout type="info">
+`DB.table()` is deliberately lower-level: no casts, no soft deletes, no global scopes, no model events. When those matter, reach for a [model](/docs/database/models).
+</Callout>

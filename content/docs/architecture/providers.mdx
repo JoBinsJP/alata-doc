@@ -1,0 +1,216 @@
+---
+title: Service Providers
+description: Bootstrap every part of your application through providers and their lifecycle hooks.
+icon: Boxes
+---
+
+Service providers are the units of bootstrapping in Alata. Each provider binds its services into the [container](/docs/architecture/container), then participates in the shared boot lifecycle — the framework's database engines, cache, queue broker, and health endpoints are all wired this way, and your own services should be too.
+
+## Anatomy of a provider
+
+A provider subclasses `ServiceProvider` and overrides only the hooks it needs. Base-class no-ops are detected and skipped automatically, so an empty hook costs nothing — no call, no log line.
+
+```python title="app/providers/http_client_provider.py"
+import httpx
+
+from alata.support.service_provider import ServiceProvider
+
+
+class HttpClientProvider(ServiceProvider):
+    def register(self) -> None:
+        client = httpx.AsyncClient(timeout=10.0)
+        self.app.singleton("http_client", lambda: client)
+
+    async def shutdown(self) -> None:
+        await self.app.make("http_client").aclose()
+```
+
+Every provider is constructed with the application kernel, available as `self.app` — which is also the container, so `self.app.singleton(...)`, `self.app.make(...)`, and friends all work directly. An optional second constructor argument lands on `self.config`.
+
+## The lifecycle hooks
+
+The [application lifecycle](/docs/architecture/lifecycle) calls the hooks in a fixed order across *all* providers: every provider registers before any provider boots.
+
+### `register()`
+
+The binding phase. Put services into the container — and nothing else.
+
+```python
+def register(self) -> None:
+    self.app.singleton("mailer", lambda: Mailer())
+```
+
+Three rules keep registration predictable:
+
+1. **Do not resolve other services.** Other providers may not have registered yet, and the container [enforces this](/docs/architecture/container#the-registration-guard) — `self.app.make()` raises `RuntimeError` during this phase. The only exception is pre-built instance bindings, notably the Phase-0 `"config"` and `"settings"`, which are always safe to read:
+
+   ```python
+   def register(self) -> None:
+       connections = self.app.make("config").get("redis.connections", {})
+   ```
+
+2. **Create objects eagerly if `boot()` or `async_boot()` depends on them.** A lazy factory has not run by the time `boot()` executes, so provider state it would have set does not exist yet.
+
+3. **Factory closures must be pure** — they must not write back to `self`:
+
+   ```python
+   # Wrong — lazy factory with side effects on self
+   self.app.singleton("x", self._create_x)   # sets self._x inside
+
+   # Correct — eager, pure
+   obj = self._create_x()
+   self.app.singleton("x", lambda: obj)
+   ```
+
+### `boot()`
+
+Runs after **all** providers have registered, so every container binding is available via `self.app.make()`. Wire event listeners, include routers, configure resolved services:
+
+```python
+def boot(self) -> None:
+    dispatcher = self.app.make("events")
+    dispatcher.listen(OrderShipped, SendShipmentNotification)
+```
+
+`boot()` is synchronous — async work belongs in the next hook.
+
+### `async_boot()`
+
+Runs inside the FastAPI lifespan at server startup, so an event loop is guaranteed. Use it for opening async connection pools, awaiting one-time setup calls, or any I/O-bound initialization that cannot be done synchronously.
+
+```python
+async def async_boot(self) -> None:
+    await self.app.make("search_index").connect()
+```
+
+<Callout type="warn">
+Objects you initialize in `async_boot()` must already exist — create them in `register()`. And since `async_boot()` only runs when the lifespan starts, code paths that never start a server (a one-off console command, for instance) will not have run it.
+</Callout>
+
+### `boot_http(app)`
+
+Runs only when an HTTP kernel is attached, and receives the FastAPI application instance. Mount routes, add middleware, or hook startup events:
+
+```python
+def boot_http(self, app) -> None:
+    from fastapi import APIRouter
+
+    router = APIRouter(tags=["reports"])
+
+    @router.get("/reports/summary")
+    async def summary():
+        return {"status": "ok"}
+
+    app.include_router(router)
+```
+
+This is exactly how the framework's health provider mounts `/health` without any code in your project. Console commands and queue workers never trigger this phase.
+
+### `shutdown()`
+
+Async graceful teardown, called from the lifespan on server shutdown — in **reverse** registration order, so services close after everything that depends on them. Close connections, flush buffers, release resources:
+
+```python
+async def shutdown(self) -> None:
+    await self.app.make("http_client").aclose()
+```
+
+### `commands()`
+
+Providers are also how console commands reach the `./alata` CLI. The primary path under the application kernel is `self.app.add_commands([...])` in `register()` — the framework's own database provider registers the `migrate` family this way:
+
+```python
+def register(self) -> None:
+    self.app.add_commands([SyncCatalogCommand, PruneReportsCommand])
+```
+
+Providers can additionally expose a `commands()` hook returning a list of commands; the console kernel discovers and registers these when assembling the command set:
+
+```python
+def commands(self) -> list:
+    return [SyncCatalogCommand, PruneReportsCommand]
+```
+
+## Registering your provider
+
+Providers are declared in two places in a scaffolded project.
+
+`bootstrap/providers.py` holds the ordered lists the kernel loads:
+
+```python title="bootstrap/providers.py"
+FRAMEWORK_PROVIDERS = [
+    RedisProvider,
+    EventProvider,
+    QueueProvider,
+    CacheProvider,
+    HealthProvider,
+    StorageProvider,
+]
+
+PROVIDERS = [
+    # Add your application providers here:
+    "app.providers.http_client_provider",
+]
+```
+
+Entries can be provider classes or module-path strings; a string module is imported and its `Provider` class instantiated. Order matters — lists execute top to bottom, and `PROVIDERS` runs after the framework tier, so your providers can resolve framework services in their `boot()`.
+
+`bootstrap/application.py` then passes everything to the kernel:
+
+```python title="bootstrap/application.py"
+app = Application(
+    base_path=Path(__file__).parent.parent,
+    providers=[
+        DatabaseProvider,
+        CommandProvider,
+        *FRAMEWORK_PROVIDERS,
+        *PROVIDERS,
+        FastapiProvider,
+    ],
+)
+```
+
+<Callout type="info">
+Dropping a `*_provider.py` file into `app/providers/` does **not** auto-load it. The kernel scans that directory at boot and logs a warning for any provider file not declared in `bootstrap/providers.py`, but it will not run it — registration is always explicit.
+</Callout>
+
+### Scaffolding with `make:provider`
+
+The console can generate and register a provider in one step:
+
+```bash
+./alata make:provider Payment
+```
+
+This creates `app/providers/payment_provider.py` from a stub and appends `"app.providers.payment_provider"` to the `PROVIDERS` list in `bootstrap/providers.py`. If the file or the entry already exists, the command tells you and leaves things alone.
+
+## Built-in providers
+
+The kernel hardcodes two base providers — logging and database — that load in every boot profile. The rest ship in the scaffold's `FRAMEWORK_PROVIDERS` list, so you can reorder or remove them (carefully — order is significant, e.g. cache wraps the redis clients).
+
+| Provider | Import | What it binds / does |
+| --- | --- | --- |
+| Log | `alata.providers.log_provider` | Binds the `"log"` manager (with `LogManager` type-mapped for `@inject`) and configures the root logger; always loads first. |
+| Database | `alata.providers.database_provider` | Initializes sync + async database engines from `database.connections`, binds `"engine"` and `"migrator"`, registers the `migrate` command family, disposes pools on shutdown. |
+| Redis | `alata.providers.redis_provider` | Binds one `"redis.<name>"` (and `"redis.<name>.async"`) singleton per configured connection, deduplicating connections that share a URL; closes resolved clients on shutdown. |
+| Events | `alata.providers.event_provider` | Binds the `"events"` dispatcher singleton for event → listener mappings. |
+| Queue | `alata.providers.queue_provider` | Binds the `"queue.broker"` singleton — the broker workers and task definitions resolve. |
+| Cache | `alata.providers.cache_provider` | Binds `"cache"` (redis-backed store, falling back to a null store when Redis is unavailable) and `"cache.null"`. |
+| Health | `alata.providers.health_provider` | No bindings; mounts `/health`, `/health/db`, and `/health/metrics` during HTTP boot. |
+| Storage | `alata.providers.storage_provider` | Binds `"storage"` with the local-file and S3 drivers configured under `filesystem.disks`. |
+| FastAPI | `alata.http` (`FastapiProvider`) | Builds the FastAPI kernel with the async lifecycle wired into its lifespan, attaches it to the application, and registers the maintenance-mode `up`/`down` commands. |
+
+The scaffolded project extends `FastapiProvider` in `app/providers/fastapi_provider.py` to layer on middleware (CORS, gzip, trusted hosts, request logging, maintenance mode) and include your API routes — a good example of subclassing a framework provider rather than replacing it.
+
+## Hook order at a glance
+
+| Hook | Sync/async | When | Runs for |
+| --- | --- | --- | --- |
+| `register()` | sync | Kernel construction, Phase 1 | Every entry point |
+| `boot()` | sync | Kernel construction, after all registrations | Every entry point |
+| `boot_http(app)` | sync | Kernel construction, HTTP kernel attached | HTTP only |
+| `async_boot()` | async | Lifespan startup | HTTP server (and anything driving the lifespan) |
+| `shutdown()` | async | Lifespan teardown, reverse order | HTTP server (and anything driving the lifespan) |
+| `commands()` | sync | Console kernel build | CLI |
+
+For the full picture of when each phase fires — including the mermaid boot-sequence diagram — see the [application lifecycle](/docs/architecture/lifecycle).

@@ -1,0 +1,325 @@
+---
+title: Horizon
+description: A real-time web dashboard and process manager for your Alata queue workers, published as taskiq-horizon.
+icon: Gauge
+---
+
+Horizon gives your [queues](/docs/digging-deeper/queues) a real-time web dashboard and a production-grade process manager. Instead of starting bare workers, you start one Horizon master process that spawns, balances, and autoscales worker processes per queue — while the dashboard shows you every job as it moves through the system: pending, completed, silenced, and failed jobs with full tracebacks, batches, tag monitoring, and throughput/latency charts.
+
+Horizon ships as its own package, `taskiq-horizon`, and its control plane is Redis-backed: job state, metrics, workload, and supervisor commands all live in Redis.
+
+## What You Get
+
+- **Real-time dashboard** — pending, completed, silenced, and failed jobs as they happen, with payloads and runtimes.
+- **Failed job forensics** — every failure stores the full traceback plus a structured exception context (type, queue, attempts, tags), and can be retried from the UI.
+- **Batches** — inspect and retry [job batches](/docs/digging-deeper/queues) from the dashboard.
+- **Metrics** — throughput and runtime charts per job type and per queue, built from periodic snapshots.
+- **Tag monitoring** — tag jobs (for example `tenant:42`) and watch just that subset.
+- **Process management** — supervisors with `auto`, `simple`, and `false` balancing modes, per-queue autoscaling, and memory limits.
+
+## Installation
+
+`taskiq-horizon` is installed straight from its GitHub repository. Pin a release tag with a uv git source:
+
+```toml title="pyproject.toml"
+[project]
+dependencies = [
+    # ...
+    "taskiq-horizon",
+]
+
+[tool.uv.sources]
+taskiq-horizon = { git = "https://github.com/JoBinsJP/taskiq-horizon.git", tag = "v0.1.3" }
+```
+
+Then sync your environment:
+
+```bash
+uv sync
+```
+
+## Configuration
+
+Horizon is configured from a `config/horizon.py` module in your application. It builds a `HorizonConfig` — including one supervisor layout per environment — that your Horizon provider binds into the container:
+
+```python title="config/horizon.py"
+from taskiq_horizon.config import HorizonConfig, TrimSettings
+from taskiq_horizon.supervisor import SupervisorOptions
+
+from config.settings import settings
+
+horizon_config = HorizonConfig(
+    prefix="myapp-horizon:",
+    redis_url=settings.REDIS_URL,
+    environments={
+        "production": {
+            "supervisor-1": SupervisorOptions(
+                broker_path="bootstrap.broker:broker",
+                queue="default,high,low",
+                worker_args=[
+                    "--fs-discover",
+                    "--tasks-pattern", "app/tasks/*_tasks.py",
+                    "--max-async-tasks", "25",
+                ],
+                min_processes=1,
+                max_processes=20,
+            )
+        },
+        "local": {
+            "supervisor-1": SupervisorOptions(
+                broker_path="bootstrap.broker:broker",
+                queue="default,high,low",
+                worker_args=[
+                    "--fs-discover",
+                    "--tasks-pattern", "app/tasks/*_tasks.py",
+                    "--max-async-tasks", "25",
+                ],
+                min_processes=1,
+                max_processes=3,
+            )
+        },
+    },
+    trim=TrimSettings(
+        recent=60,            # keep recent jobs for 1 hour (minutes)
+        pending=60,
+        completed=60,
+        recent_failed=10080,  # keep failed jobs for 7 days
+        failed=10080,
+        monitored=10080,
+    ),
+    waits={"default": 60, "high": 30, "low": 120},
+    silenced=[],
+    silenced_tags=[],
+)
+```
+
+When the master supervisor starts, it looks up `environments[<current environment>]` and builds one supervisor per entry — so production can run twenty processes while your laptop runs three, from the same file.
+
+### `HorizonConfig` keys
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `prefix` | `"taskiq-horizon:"` | Prefix for every Redis key Horizon writes. Use one prefix per app sharing a Redis instance. |
+| `name` | `""` | Display name suffix shown in the dashboard title/header. |
+| `path` | `"horizon"` | Route path the dashboard is mounted under (e.g. `"horizon"`, `"ops/horizon"`). |
+| `proxy_path` | `""` | External proxy path prefix for the dashboard's router (e.g. `"/admin"`) when served behind a path-rewriting proxy. |
+| `redis_url` | `"redis://localhost:6379/0"` | Redis connection used by Horizon's control plane. |
+| `trim` | `TrimSettings()` | How long (in **minutes**) to keep job records: `recent`, `pending`, `completed`, `recent_failed`, `failed`, `monitored`. |
+| `silenced` / `silenced_tags` | `[]` | Task names / tags to hide from the main job lists (they land in the Silenced tab). |
+| `metrics` | `HorizonMetricsConfig()` | Snapshot retention: `trim_snapshots.job` and `trim_snapshots.queue`, in **hours** (default 24). |
+| `waits` | `{"default": 60}` | Per-queue wait-time thresholds in **seconds** before a long-wait event fires. |
+| `memory_limit` | `512` | Memory (MB) the master process may consume before a graceful restart is requested. |
+| `environments` | `{}` | `{environment: {supervisor_name: SupervisorOptions}}` — the supervisor layout per environment. |
+
+### `SupervisorOptions`
+
+Each supervisor manages one queue — or a comma-separated set of queues — with its own scaling and resource limits:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `queue` | `"default"` | Queue name, or comma-separated list (`"default,high,low"`). |
+| `balance` | `"auto"` | Balancing mode: `"auto"`, `"simple"`, or `"false"` (see below). |
+| `min_processes` | `1` | Minimum worker processes for the supervisor. |
+| `max_processes` | `10` | Maximum worker processes for the supervisor. |
+| `memory` | `128` | Memory limit (MB) per worker process before it is recycled. |
+| `timeout` | `60` | Seconds a worker may run a job before being considered stuck. |
+| `balance_cooldown` | `3` | Seconds between autoscaling adjustments. |
+| `balance_max_shift` | `1` | Maximum processes added/removed per adjustment. |
+| `auto_scale_by_num_jobs` | `False` | Scale on queue length instead of projected time-to-clear. |
+| `auto_scaling_strategy` | `"time"` | The default strategy weighs each queue by *time to clear* (queue length × recent average runtime). |
+| `broker_path` | `""` | Import path of your broker, e.g. `"bootstrap.broker:broker"` — what each worker process loads. |
+| `worker_args` | `[]` | Extra CLI arguments passed to each worker process (task discovery patterns, `--max-async-tasks`, ...). |
+| `worker_queue_env_var` | `"QUEUE_NAME"` | Environment variable each worker receives with its assigned queue. |
+
+#### Balancing modes
+
+- **`auto`** (default) — each queue gets its own worker pool, and the autoscaler continuously shifts processes between pools based on each queue's projected time-to-clear (or queue length, with `auto_scale_by_num_jobs=True`), within `min_processes`/`max_processes`. A busy `high` queue borrows workers from an idle `low` queue.
+- **`simple`** — each queue gets its own pool and processes are split evenly between them; no autoscaling.
+- **`"false"`** — a single pool of workers consumes the comma-separated queue list in the order given, so earlier queues act as higher priority.
+
+<Callout type="info">
+`worker_args` is where per-worker concurrency lives: `"--max-async-tasks", "25"` caps how many async tasks a single worker process runs simultaneously. Total concurrency is roughly `processes × max async tasks`.
+</Callout>
+
+## Registering the Provider
+
+Wire Horizon into your application with a thin [service provider](/docs/architecture/providers): bind the config and a Redis connection, then delegate everything else to the package's `HorizonServiceProvider`.
+
+```python title="app/providers/horizon_provider.py"
+from alata.support.service_provider import ServiceProvider
+
+
+class Provider(ServiceProvider):
+    def __init__(self, app):
+        super().__init__(app)
+        from taskiq_horizon.service_provider import HorizonServiceProvider
+
+        self.package_provider = HorizonServiceProvider(app)
+
+    def register(self):
+        import redis.asyncio as aioredis
+
+        from config.horizon import horizon_config
+
+        # Host-owned bindings — config and the Redis connection
+        self.app.singleton("horizon.config", lambda: horizon_config)
+        self.app.singleton(
+            "horizon.redis",
+            lambda: aioredis.from_url(horizon_config.redis_url, decode_responses=False),
+        )
+
+        # Repositories, middleware, and services come from the package
+        self.package_provider.register()
+
+    def boot(self):
+        self.package_provider.boot()
+
+        # Attach Horizon's tracking middleware to the queue broker
+        middleware = self.app.make("horizon.middleware")
+        broker = self.app.make("queue.broker")
+        broker.add_middlewares(middleware)
+
+        # Dashboard mounting is HTTP-only — the HTTP kernel exposes .fastapi
+        if hasattr(self.app, "fastapi"):
+            from alata.queue.batch_repository import BatchRepository
+
+            self.app.add_commands(self.package_provider.commands())
+            self.package_provider.mount_dashboard(
+                self.app.fastapi,
+                broker=broker,
+                batch_repo=BatchRepository,
+            )
+
+    def commands(self) -> list:
+        """Expose the Horizon console commands to the ./alata CLI."""
+        return self.package_provider.commands()
+```
+
+Then add it to your provider list:
+
+```python title="bootstrap/providers.py"
+from app.providers.horizon_provider import Provider as HorizonProvider
+
+PROVIDERS = [
+    # ...
+    HorizonProvider,
+]
+```
+
+Three things happen here:
+
+1. **The middleware** (`horizon.middleware`) hooks into every send, execute, success, and failure on the broker — that's how the dashboard sees jobs in real time.
+2. **`mount_dashboard`** attaches the JSON API and the single-page dashboard to your HTTP application under `HorizonConfig.path` — `/horizon` by default. Passing `batch_repo` lights up the Batches tab.
+3. **`commands()`** registers the `horizon*` console commands with the `./alata` CLI.
+
+## Running Horizon
+
+Start the master supervisor with a single command:
+
+```bash
+./alata horizon
+```
+
+The master boots your application, reads `environments[<current environment>]` from `horizon.config`, and starts one supervisor per entry. Each supervisor spawns worker processes for its queues (each worker loads your broker via `broker_path` and receives its queue through the `QUEUE_NAME` environment variable), consumes dashboard commands from Redis, runs the autoscaler, and monitors worker health and memory — recycling any process that exceeds its `memory` limit.
+
+Stopping the master with `Ctrl+C` (or `SIGTERM` in production) shuts the whole tree down gracefully.
+
+<Callout type="info">
+With Horizon you do not run queue workers directly — the master supervisor owns the worker processes. Run exactly one `./alata horizon` process per machine, under your process monitor of choice, and let it manage everything below it.
+</Callout>
+
+### Pausing and resuming
+
+Signal every supervisor on every running master through Redis:
+
+```bash
+./alata horizon:pause      # stop processing new jobs (workers stay alive)
+./alata horizon:continue   # resume processing
+./alata horizon:terminate  # gracefully terminate all supervisors
+```
+
+Because the commands go through Horizon's Redis command queue, they work across machines — you can pause a fleet from any host that shares the Redis instance.
+
+### Metrics snapshots
+
+The dashboard's throughput and runtime charts are built from periodic snapshots. Capture one with:
+
+```bash
+./alata horizon:snapshot
+```
+
+Schedule it every five minutes in your [console kernel](/docs/digging-deeper/scheduling) so the graphs stay populated:
+
+```python title="app/console/kernel.py"
+def schedule(self, schedule: Schedule):
+    schedule.command("horizon:snapshot").every_five_minutes()
+```
+
+Snapshot history is trimmed after `metrics.trim_snapshots.job` / `.queue` hours (24 by default).
+
+## The Dashboard
+
+With the provider booted, the dashboard is served by your HTTP application at `/horizon` (or whatever `path` you configured). It includes:
+
+- **Overview** — jobs per minute, current workload per queue, max wait times, and the status of every master and supervisor.
+- **Pending / Completed / Silenced jobs** — live job lists with payloads and runtimes.
+- **Failed jobs** — full stored traceback, structured exception context, and one-click retry.
+- **Batches** — batch progress and per-batch retry of failed jobs.
+- **Metrics** — throughput and runtime charts per job type and per queue.
+- **Monitoring** — follow all jobs carrying a specific tag.
+
+### Tagging jobs
+
+Tags come from the task's labels. Add them where you define the task:
+
+```python title="app/tasks/billing_tasks.py"
+from bootstrap.broker import broker
+
+
+@broker.task(tags="tenant:42,billing")
+async def charge_invoice(invoice_id: int):
+    ...
+```
+
+A list works too (`tags=["tenant:42", "billing"]`). Tags show up on every job in the dashboard, and any tag added under **Monitoring** collects its jobs into a dedicated view. Tags listed in `silenced_tags` (or task names in `silenced`) are diverted to the Silenced tab instead of the main feed.
+
+## Failed Jobs and Exception Context
+
+When a job fails, Horizon stores the complete traceback for the dashboard's stacktrace panel — and builds a structured **context** alongside it, automatically:
+
+```json
+{
+  "exception_type": "PaymentDeclinedError",
+  "connection": "redis",
+  "queue": "default",
+  "task_name": "charge_invoice",
+  "attempts": 3,
+  "tags": ["tenant:42", "billing"],
+  "labels": {"queue_name": "default"}
+}
+```
+
+If the exception itself carries a `context` attribute — or a `context()` method returning a dict — Horizon merges it into the stored context, so you can attach domain details at the point of failure:
+
+```python
+class PaymentDeclinedError(Exception):
+    def __init__(self, invoice_id: int, reason: str):
+        super().__init__(f"Payment declined: {reason}")
+        self.invoice_id = invoice_id
+        self.reason = reason
+
+    def context(self) -> dict:
+        return {"invoice_id": self.invoice_id, "decline_reason": self.reason}
+```
+
+The dashboard renders the merged context next to the traceback on the failed-job page. Failed job records are kept for `trim.failed` minutes (7 days by default) and can be retried or deleted from the UI.
+
+<Callout type="info">
+This is the same `context()` convention used by the framework's [exception handler](/docs/basics/error-handling) for report enrichment — one method serves both your logs and your queue dashboard.
+</Callout>
+
+## Securing the Dashboard
+
+<Callout type="warn">
+Horizon ships **no built-in authentication or authorization**. The dashboard and its JSON API are ordinary routes mounted on your application — anyone who can reach `/horizon` can view job payloads, retry jobs, and purge queues. In production, put the dashboard behind your own protection: an authenticating reverse proxy or gateway in front of the `/horizon` path, or [middleware](/docs/basics/middleware) on your application that guards requests whose path starts with your configured dashboard path.
+</Callout>

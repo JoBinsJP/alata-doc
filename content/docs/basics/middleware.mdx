@@ -1,0 +1,219 @@
+---
+title: Middleware
+description: Inspect and act on every request with built-in and custom middleware, configured declaratively in one file.
+icon: Layers
+---
+
+Middleware wraps every HTTP request, running code before it reaches your routes and after the response is produced. Alata ships maintenance mode and request logging out of the box, wires CORS, GZip, and trusted-host protection through one declarative config file, and makes registering your own middleware a two-step exercise.
+
+## How Middleware Is Configured
+
+All middleware settings live in `config/middleware.py` as plain dicts:
+
+```python title="config/middleware.py"
+CORS = {
+    "allow_origins": ["http://localhost:3000"],
+    "allow_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    "allow_headers": ["Content-Type", "Authorization", "X-Request-ID"],
+    "allow_credentials": True,
+    "max_age": 600,
+}
+
+GZIP = {"minimum_size": 500, "enabled": True}
+
+TRUSTED_HOSTS = {
+    "allowed_hosts": ["localhost", "127.0.0.1"],
+    "enabled": settings.is_production(),   # only enforce in production
+}
+
+REQUEST_LOGGING = {
+    "enabled": True,
+    "exclude_paths": ["/health", "/favicon.ico", "/docs", "/openapi.json", "/metrics"],
+    "slow_request_threshold": 5.0,
+}
+
+MAINTENANCE_MODE = {
+    "bypass_paths": ["/health"],
+}
+```
+
+During boot these dicts are merged into the config repository under the `middleware.*` namespace — `middleware.cors`, `middleware.gzip`, `middleware.trusted_hosts`, `middleware.request_logging`, and `middleware.maintenance_mode` — so framework code can read them with dot notation:
+
+```python
+from alata.container import container
+
+container.make("config").get("middleware.maintenance_mode.bypass_paths")
+# ["/health"]
+```
+
+Your application's HTTP provider reads the same dicts and attaches each middleware to the kernel:
+
+```python title="app/providers/fastapi_provider.py"
+from alata.http import FastapiProvider as HttpProvider
+
+
+class FastapiProvider(HttpProvider):
+    def register(self):
+        super().register()
+
+        from config.middleware import MAINTENANCE_MODE, REQUEST_LOGGING
+
+        from alata.http.middleware.maintenance_mode_middleware import MaintenanceModeMiddleware
+
+        self.app.fastapi.add_middleware(
+            MaintenanceModeMiddleware,
+            bypass_paths=MAINTENANCE_MODE.get("bypass_paths"),
+        )
+
+        if REQUEST_LOGGING.get("enabled", True):
+            from alata.http.middleware.request_logging_middleware import RequestLoggingMiddleware
+
+            self.app.fastapi.add_middleware(
+                RequestLoggingMiddleware,
+                exclude_paths=REQUEST_LOGGING.get("exclude_paths"),
+                slow_threshold=REQUEST_LOGGING.get("slow_request_threshold", 5.0),
+            )
+        # ... GZip, TrustedHost, CORS, IdentityMiddleware
+```
+
+Because the middleware stack is plain code in *your* provider, adding, removing, or reordering middleware never requires touching the framework.
+
+<Callout type="info">
+`add_middleware` builds the stack outside-in: the **last** middleware added is the outermost and runs **first** on each request. The scaffold adds `IdentityMiddleware` last so the acting user is already resolved by the time request logging (added earlier) writes its line.
+</Callout>
+
+## Maintenance Mode
+
+`MaintenanceModeMiddleware` returns a `503 Service Unavailable` for every request while the application is in maintenance mode:
+
+```json
+{ "message": "Service is currently undergoing maintenance. Please try again shortly." }
+```
+
+The response carries a `Retry-After: 60` header so well-behaved clients and crawlers back off.
+
+### Toggling Maintenance Mode
+
+Use the project CLI:
+
+```bash
+./alata down    # enter maintenance mode
+./alata up      # back to normal
+```
+
+Both commands are registered automatically by the framework's HTTP provider, so every Alata app has them.
+
+### How State Is Stored
+
+Maintenance mode is a flag *file*: `storage/framework/down` in your project root. `./alata down` creates it, `./alata up` deletes it, and the middleware simply checks for its existence on each request. That means:
+
+- It survives restarts and works across multiple workers on the same host — no database or cache involved.
+- In an emergency you can toggle it without the CLI: `touch storage/framework/down` / `rm storage/framework/down`.
+- The [scheduler](/docs/digging-deeper/scheduling) also respects the flag and skips due events while it exists (unless a task is marked to run even in maintenance mode).
+
+### Bypass Paths
+
+Paths listed in `MAINTENANCE_MODE["bypass_paths"]` are served normally while the app is down. The default, `["/health"]`, keeps load-balancer probes green so your instances are not pulled out of rotation during a planned maintenance window. Matching is exact-path.
+
+## Request Logging
+
+`RequestLoggingMiddleware` writes one log line per request through the [logging system](/docs/basics/logging):
+
+```
+GET /api/v1/orders → 200 (0.042s) [user-123] rid=a1b2c3d4
+```
+
+It logs the method, path, status code, duration, acting user (from `request.state.user_id` when the identity middleware has set it, otherwise `-`), and a request id.
+
+### Request IDs
+
+The middleware reads the incoming `X-Request-ID` header — or generates a short id if absent — stores it on `request.state.request_id`, and sets `X-Request-ID` on the response. Pass the header between services and you can trace a single request across your whole system.
+
+### Log Levels
+
+The level is chosen from the outcome:
+
+| Condition | Level |
+| --- | --- |
+| Duration ≥ `slow_request_threshold` (default 5.0s) | `WARNING`, prefixed `SLOW` |
+| Status ≥ 500 | `ERROR` |
+| Status ≥ 400 | `WARNING` |
+| Everything else | `INFO` |
+
+### Tuning
+
+In `config/middleware.py`, `REQUEST_LOGGING` supports:
+
+- `enabled` — set `False` to skip registering the middleware entirely.
+- `exclude_paths` — endpoints that are never logged (health checks, `/docs`, metrics). Excluded requests still receive a request id.
+- `slow_request_threshold` — seconds before a request is flagged `SLOW`.
+
+## Writing Your Own Middleware
+
+Middleware is a standard ASGI `BaseHTTPMiddleware` subclass with a `dispatch` method. The scaffold's `IdentityMiddleware` is a complete example:
+
+```python title="app/http/middleware.py"
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+
+class IdentityMiddleware(BaseHTTPMiddleware):
+    """Resolve the acting user from headers into request.state."""
+
+    async def dispatch(self, request: Request, call_next):
+        user_id = request.headers.get("X-User-Id")
+        guest_id = request.headers.get("X-Guest-Id")
+        request.state.user_id = user_id or guest_id or "anonymous"
+        return await call_next(request)
+```
+
+Everything before `await call_next(request)` runs on the way in; everything after runs on the way out, with the response in hand:
+
+```python title="app/http/middleware.py"
+class TimingHeaderMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        import time
+
+        start = time.perf_counter()
+        response = await call_next(request)
+        response.headers["X-Elapsed"] = f"{time.perf_counter() - start:.3f}"
+        return response
+```
+
+### Registering It
+
+Add it to the stack in your app's `FastapiProvider.register()`:
+
+```python title="app/providers/fastapi_provider.py"
+from app.http.middleware import TimingHeaderMiddleware
+
+
+class FastapiProvider(HttpProvider):
+    def register(self):
+        super().register()
+        # ... built-in middleware ...
+        self.app.fastapi.add_middleware(TimingHeaderMiddleware)
+```
+
+Middleware classes that take options accept them as keyword arguments to `add_middleware`, delivered to your `__init__`:
+
+```python
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, limit: int = 100):
+        super().__init__(app)
+        self._limit = limit
+```
+
+```python
+self.app.fastapi.add_middleware(RateLimitMiddleware, limit=60)
+```
+
+Follow the scaffold's convention and source those options from a dict in `config/middleware.py` so all tuning stays in one file.
+
+<Callout type="info">
+[Service providers](/docs/architecture/providers) can also implement a `boot_http(app)` hook — the kernel calls it with the FastAPI instance after all providers have booted. It is how framework packages attach their own routes and middleware, and it works just as well for reusable packages of your own.
+</Callout>
+
+<Callout type="warn">
+Middleware runs on **every** request, including excluded and bypassed paths (the exclusion happens inside the middleware's own `dispatch`). Keep `dispatch` fast and non-blocking — no synchronous I/O — or every endpoint pays the cost.
+</Callout>

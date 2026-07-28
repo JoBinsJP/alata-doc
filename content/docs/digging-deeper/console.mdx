@@ -1,0 +1,209 @@
+---
+title: Console
+description: Run built-in framework commands and write your own with the ./alata CLI.
+icon: SquareTerminal
+---
+
+Every Alata project ships with `./alata`, a command-line interface at the root of your application. It runs the same kernel as your HTTP server — the same providers register, the same container bindings resolve — so anything your app can do, a console command can do too. The console layer is built on cleo, so you get argument parsing, styled output, and auto-generated help for free.
+
+## Running commands
+
+List every available command:
+
+```bash
+./alata list
+```
+
+Get help for a specific command, including its arguments and options:
+
+```bash
+./alata help migrate
+```
+
+Every command also accepts a few global options: `-h/--help`, `-q/--quiet`, `-V/--version`, `-n/--no-interaction`, and `-v`/`-vv`/`-vvv` for increasing verbosity.
+
+<Callout type="info">
+The `./alata` script automatically re-executes itself with your project's `.venv` Python if the virtualenv is not active — you never need to `source .venv/bin/activate` first.
+</Callout>
+
+## Built-in commands
+
+The framework registers this command set out of the box:
+
+| Command | Description |
+| --- | --- |
+| `list` | List all available commands. |
+| `help <command>` | Display help for a command. |
+| `serve` | Start the HTTP server (`--host`, `--port`, `--workers`, `--no-reload`). |
+| `migrate` | Run all pending database migrations. |
+| `migrate:rollback` | Roll back the last batch of migrations. |
+| `migrate:fresh` | Drop all tables and re-run every migration from scratch. |
+| `migrate:sync` | Mark all existing migrations as run without executing SQL. |
+| `migrate:status` | Show the status of all migrations. |
+| `make:migration <name>` | Generate a new migration file. |
+| `make:provider <name>` | Generate a service provider and register it in `bootstrap/providers.py`. |
+| `db:status` | Display connection pool metrics for all database connections. |
+| `up` | Bring the application out of maintenance mode. |
+| `down` | Put the application into maintenance mode. |
+| `queue:work` | Start a queue worker process (`--queue`, `--workers`, `--reload`). |
+| `queue:failed` | List failed jobs (`--limit`, default 20). |
+| `queue:retry <uuid>` | Re-dispatch a failed job back to the queue (or `--all`). |
+| `queue:flush` | Delete all failed jobs. |
+| `queue:prune-orphans` | Prune orphaned background jobs. |
+| `queue:prune-batches` | Prune stale job batches (`--hours`, `--unfinished`). |
+| `schedule:run` | Evaluate and execute all due scheduled events. |
+| `schedule:list` | List all registered scheduled events in a table. |
+
+The `queue:*` family is covered in depth on the [queues page](/docs/digging-deeper/queues), and `schedule:*` on the [scheduling page](/docs/digging-deeper/scheduling).
+
+### Maintenance mode
+
+`./alata down` creates a flag file at `storage/framework/down`. While it exists, the maintenance-mode [middleware](/docs/basics/middleware) returns `503` for every request and the scheduler skips due events (unless an event is marked `even_in_maintenance_mode()`). `./alata up` removes the flag. Both commands are idempotent — running them twice just prints a notice.
+
+## Writing commands
+
+A command is a class extending `Command` from `alata.foundation.console`. Declare a `name` and `description`, optionally declare `arguments` and `options`, and implement `handle()`:
+
+```python title="app/console/commands/send_report.py"
+from cleo.helpers import argument, option
+
+from alata.foundation.console import Command
+
+
+class SendReportCommand(Command):
+    name = "report:send"
+    description = "Compile and email the daily activity report"
+
+    arguments = [
+        argument("recipient", "Email address to deliver the report to"),
+    ]
+    options = [
+        option("days", "d", "Number of days to include", flag=False, default="7"),
+        option("dry-run", None, "Build the report without sending it", flag=True),
+    ]
+
+    def handle(self) -> int:
+        recipient = self.argument("recipient")
+        days = int(self.option("days"))
+
+        self.line(f"<info>Compiling report for the last {days} day(s)...</info>")
+
+        if self.option("dry-run"):
+            self.line("<comment>Dry run — nothing sent.</comment>")
+            return 0
+
+        reporter = self.container.make("reporter")
+        reporter.send(recipient, days=days)
+
+        self.info(f"Report sent to {recipient}.")
+        return 0
+```
+
+A few things to notice:
+
+- **Arguments and options** are declared with the `argument()` and `option()` helpers from `cleo.helpers`. Pass `flag=True` for boolean switches and `flag=False` when the option takes a value; `optional=True` makes an argument optional.
+- **Input** is read with `self.argument("name")` and `self.option("name")`. Option values arrive as strings — cast them yourself.
+- **Output** goes through `self.line(...)` (supports `<info>`, `<comment>`, `<error>` style tags), plus the shortcuts `self.info(...)` and `self.line_error(...)`. Check verbosity with `self.io.is_verbose()` / `self.io.is_very_verbose()` / `self.io.is_debug()`.
+- **Exit codes** are the return value of `handle()` — return `0` for success, non-zero for failure.
+- **The container** is available as `self.container` on every command registered with the application, so you can resolve any bound service. See the [service container](/docs/architecture/container) page.
+
+### Async work in commands
+
+`handle()` is synchronous. When a command needs async APIs — the async query builder, the queue broker, redis — wrap the async body with `asyncio.run()`. This is exactly how the built-in `queue:*` commands work:
+
+```python title="app/console/commands/prune_sessions.py"
+import asyncio
+
+from alata.foundation.console import Command
+
+
+class PruneSessionsCommand(Command):
+    name = "sessions:prune"
+    description = "Delete expired sessions"
+
+    def handle(self) -> int:
+        return asyncio.run(self.handle_async())
+
+    async def handle_async(self) -> int:
+        import time
+
+        from app.models.session import Session
+
+        deleted = await Session.where("expires_at", "<", int(time.time())).adelete()
+        self.info(f"Pruned {deleted} session(s).")
+        return 0
+```
+
+## Registering commands
+
+Commands are registered on the application kernel via providers. The scaffolded project ships a dedicated `CommandProvider` for exactly this:
+
+```python title="app/providers/command_provider.py"
+from alata.support.service_provider import ServiceProvider
+
+from app.console.commands.send_report import SendReportCommand
+
+
+class CommandProvider(ServiceProvider):
+    def boot(self):
+        self.app.add_commands([SendReportCommand])
+```
+
+`add_commands()` accepts classes or pre-built instances. When the console boots, each command is instantiated (if needed) and handed the application container, which is what makes `self.container` work inside `handle()`.
+
+This is the same mechanism the framework itself uses: the database provider registers the `migrate` family, and the HTTP provider registers `serve`, `up`, and `down` — commands live next to the [provider](/docs/architecture/providers) that owns their services.
+
+### Package commands
+
+Installable packages expose commands through the `commands()` hook on their service provider. The console kernel discovers these automatically:
+
+```python
+class Provider(ServiceProvider):
+    def commands(self) -> list:
+        return [SnapshotCommand(), PauseCommand()]
+```
+
+This is how packages such as [taskiq-horizon](/docs/packages/horizon) contribute their `horizon:*` commands to your CLI without you registering anything.
+
+## Overriding option defaults
+
+Every framework command mixes in an override mechanism that lets you change an option's default **at registration time** — useful when you want a built-in command pre-configured for your project without forking it:
+
+```python
+# Register queue:work defaulting to the "emails" queue with 4 workers
+self.app.add_commands([QueueWorkCommand(queue="emails", workers="4")])
+```
+
+Keyword names map to option names with dashes converted to underscores: an option declared as `dry-run` is overridden with `dry_run=...`.
+
+Alternatively, a subclass can declare a `_<option>_default` attribute:
+
+```python
+class ProjectQueueWorkCommand(QueueWorkCommand):
+    _queue_default = "emails"
+```
+
+## The `--config` option
+
+Framework commands also carry a shared `-C/--config` option that points database-aware commands at an alternative database configuration file. When it is not given, the `DB_CONFIG_PATH` environment variable is consulted, and finally the standard `config.database` module from your [configuration](/docs/getting-started/configuration).
+
+```bash
+./alata migrate --config=config/analytics_database.py
+```
+
+## Generator commands
+
+The `make:*` commands scaffold files into your project:
+
+- **`make:migration <name>`** — generates a timestamped migration file. Name it after the change, e.g. `./alata make:migration create_users_table`. See [database getting started](/docs/database/getting-started).
+- **`make:provider <name>`** — generates `app/providers/<name>_provider.py` from a stub **and** appends it to the `PROVIDERS` list in `bootstrap/providers.py`, so it boots immediately:
+
+```bash
+./alata make:provider S3Storage
+#   CREATED  app/providers/s3_storage_provider.py
+#   REGISTERED 'app.providers.s3_storage_provider' → bootstrap/providers.py
+```
+
+<Callout type="info">
+`make:provider` is idempotent about registration — if the module path is already listed in `bootstrap/providers.py`, it skips the append instead of duplicating it. It refuses to overwrite an existing provider file.
+</Callout>

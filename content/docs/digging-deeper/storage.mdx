@@ -1,0 +1,164 @@
+---
+title: File Storage
+description: Named storage disks with local filesystem and Amazon S3 drivers behind one facade.
+icon: HardDrive
+---
+
+Alata abstracts file storage behind named **disks**. Each disk pairs a driver — local filesystem or Amazon S3 — with its own configuration, and your code talks to all of them through the same `Storage` facade. Swap a disk from local files in development to S3 in production without touching application code.
+
+```python
+from alata.support.storage import Storage
+
+Storage.disk().put("reports/output.csv", csv_bytes)      # default disk
+Storage.disk("s3").put("reports/output.csv", csv_bytes)  # a named disk
+```
+
+## Configuring disks
+
+Disks are declared in `config/filesystem.py` as the `DISKS` dict. The special `default` key names the disk used when you call `Storage.disk()` with no argument:
+
+```python title="config/filesystem.py"
+DISKS = {
+    "default": "local",
+    "local": {
+        "driver": "file",
+        "path": "storage/framework/filesystem",
+    },
+    "s3": {
+        "driver": "s3",
+        "client": "",             # AWS access key id
+        "secret": "",             # AWS secret access key
+        "bucket": "local-bucket",
+        "region": "us-east-1",
+        "endpoint": None,         # override for S3-compatible stores
+        "use_path_style": False,  # path-style addressing (MinIO, LocalStack)
+    },
+}
+```
+
+You can declare as many disks as you like — several S3 buckets, several local roots — each with any name. The `driver` key selects the implementation: `"file"` or `"s3"`.
+
+At boot, `StorageProvider` reads `filesystem.disks`, builds the `Storage` manager with both drivers registered, and binds it in the [service container](/docs/architecture/container) as `storage`. If the config namespace is missing entirely, boot fails with a clear error telling you to add `config/filesystem.py`.
+
+## The Storage facade
+
+`Storage.disk(name)` resolves the manager from the container and returns the driver configured for that disk, ready to use:
+
+```python
+from alata.support.storage import Storage
+
+disk = Storage.disk()          # the default disk
+s3 = Storage.disk("s3")        # a specific disk
+```
+
+Requesting a disk that isn't configured raises `ValueError`.
+
+<Callout type="warn">
+All storage operations are **synchronous** — they block while reading, writing, or talking to S3. In an async request handler, run them in a worker thread (for example `await anyio.to_thread.run_sync(lambda: Storage.disk("s3").put(key, data))`), or do file work in [queued jobs](/docs/digging-deeper/queues), where blocking is fine.
+</Callout>
+
+## Driver API
+
+Both drivers expose the same core methods, so code written against one disk works against another.
+
+### Writing files
+
+```python
+disk = Storage.disk()
+
+# Write text or bytes; parent directories are created automatically
+disk.put("reports/2026/summary.txt", "quarterly numbers")
+disk.put("reports/2026/summary.pdf", pdf_bytes)
+```
+
+`put(path, content)` accepts `str` or `bytes` and returns the content it wrote.
+
+`put_file(directory, file, name=None)` stores an uploaded-file-like object (anything with a `.name` attribute, and optionally a `get_content()` method) into a directory. Without an explicit `name` it generates a UUID, preserving the original extension, and returns the relative path it stored:
+
+```python
+path = disk.put_file("uploads/avatars", upload)
+# "uploads/avatars/8f14e45f-....png"
+```
+
+`append(path, content)` adds to the end of a file; `prepend(path, content)` adds to the beginning.
+
+### Reading files
+
+```python
+text = disk.get("reports/2026/summary.txt")      # str, or None if missing
+raw = disk.get_bytes("reports/2026/summary.pdf") # bytes, or None if missing
+```
+
+Both return `None` for a missing file instead of raising — check for `None` rather than catching exceptions.
+
+### Checking, listing, and removing
+
+```python
+disk.exists("reports/2026/summary.txt")   # True / False
+disk.missing("reports/2026/summary.txt")  # the inverse
+
+disk.get_files("reports/2026")            # relative paths of files in a directory
+disk.get_files()                          # files at the disk root
+
+disk.delete("reports/2026/summary.txt")   # no error if already gone
+```
+
+On S3, `get_files()` lists objects by prefix across the whole "directory" tree; on the local driver it lists the files directly inside the given directory.
+
+### Copying and moving
+
+```python
+disk.copy("reports/draft.txt", "reports/final.txt")
+disk.move("reports/final.txt", "archive/final.txt")
+```
+
+Both operate **within** a single disk. On S3, `move` is implemented as copy-then-delete. To transfer between disks, read from one and write to the other:
+
+```python
+data = Storage.disk("local").get_bytes("exports/data.csv")
+Storage.disk("s3").put("exports/data.csv", data)
+```
+
+### MIME detection helper
+
+For serving or validating uploads, `alata.utils.filesystem.mime_type` sniffs a MIME type from magic bytes (PDF, PNG, and JPEG are recognized; anything else is `application/octet-stream`):
+
+```python
+from alata.utils.filesystem import mime_type
+
+kind = mime_type(disk.get_bytes("uploads/file.bin"))  # e.g. "image/png"
+```
+
+## The local driver
+
+The `file` driver stores files under the disk's `path`, resolved relative to the process working directory — the project root under the `./alata` and uvicorn conventions. The scaffolded disk points at `storage/framework/filesystem`, so:
+
+```python
+Storage.disk("local").put("avatars/1.png", data)
+# → <project>/storage/framework/filesystem/avatars/1.png
+```
+
+Missing parent directories are created on write. `make_directory(path)` creates a directory explicitly, and `get_path(relative)` returns the absolute filesystem path for a stored file when you need to hand it to another library.
+
+## The S3 driver
+
+The `s3` driver builds its boto3 client lazily, on first use, from the disk's own options:
+
+| Option | Meaning |
+| --- | --- |
+| `client` | AWS access key id. |
+| `secret` | AWS secret access key. |
+| `bucket` | Bucket name — every operation targets this bucket. |
+| `region` | AWS region for the session. |
+| `endpoint` | Optional endpoint URL — point it at MinIO, LocalStack, or another S3-compatible store. |
+| `use_path_style` | Use path-style addressing instead of virtual-hosted (required by many S3-compatible stores). |
+
+Because credentials live per disk, two disks can target different buckets, regions, or even different accounts. `boto3` is an optional dependency — the driver raises a clear `ModuleNotFoundError` telling you to install it if it's missing.
+
+<Callout type="info">
+S3 "not found" responses (404 / NoSuchKey) are translated to the same conventions as the local driver — `get` and `get_bytes` return `None`, `exists` returns `False`. Any other AWS error propagates as an exception.
+</Callout>
+
+<Callout type="warn">
+There is no streaming API: `get_bytes` loads the whole object into memory and `put` uploads from an in-memory value. For very large files, work with the disk's underlying tools directly — the local driver's `get_path()` gives you a real filesystem path, and for S3 you can build your own boto3 client for multipart transfers.
+</Callout>

@@ -1,0 +1,5 @@
+{
+  "title": "Digging Deeper",
+  "icon": "Wrench",
+  "pages": ["console", "scheduling", "queues", "cache", "events", "storage", "collections", "context", "health"]
+}

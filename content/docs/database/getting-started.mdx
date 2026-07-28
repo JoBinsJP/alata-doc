@@ -1,0 +1,345 @@
+---
+title: Getting Started
+description: Configure database connections and run queries with Alata's SQLAlchemy 2.0 core.
+icon: Database
+---
+
+Alata's database layer is built directly on SQLAlchemy 2.0 — including its async engine — and that is a deliberate design choice, not an implementation detail. You get a fluent, expressive API on top, and the most battle-tested SQL toolkit in Python underneath: real connection pooling, dialect-aware SQL compilation, and first-class asyncio support. Nothing is reinvented; everything is composable.
+
+The layer has four parts, each with its own page:
+
+<Cards>
+  <Card title="Query Builder" href="/docs/database/query-builder" description="Fluent, chainable queries with sync and async execution." />
+  <Card title="Models" href="/docs/database/models" description="Active-record models with relationships, casts, and events." />
+  <Card title="Migrations" href="/docs/database/migrations" description="Version your schema with the ./alata migrate family." />
+</Cards>
+
+This page covers the foundation the others stand on: connections, the `DB` facade, transactions, and pool management.
+
+## Configuration
+
+Database configuration lives in `config/database.py`. The file is purely declarative — it defines a `CONNECTIONS` dictionary keyed by connection name, and the framework's database provider builds the actual engines from it during boot:
+
+```python title="config/database.py"
+from config.settings import settings
+
+DB_CONFIG = {
+    "strict_mode": settings.EFFECTIVE_DB_STRICT_MODE,
+    "default": "postgres",
+}
+
+# DB_CONNECTION selects the driver; "pgsql" is accepted as an alias so the
+# settings default works out of the box.
+_DRIVER = {"pgsql": "postgres"}.get(settings.DB_CONNECTION, settings.DB_CONNECTION)
+
+CONNECTIONS = {
+    "default": {
+        "driver": _DRIVER,
+        "host": settings.DB_HOST,
+        "port": settings.DB_PORT,
+        "database": settings.DB_DATABASE,
+        "username": settings.DB_USERNAME,
+        "password": settings.DB_PASSWORD,
+
+        # Per-connection pool tuning
+        "pool_size": 5,
+        "max_overflow": 10,
+        "pool_pre_ping": True,
+        "pool_recycle": 1800,
+        "echo": False,
+    },
+}
+```
+
+The values come from your typed settings (backed by `.env`), so a fresh project only needs the usual environment variables:
+
+```bash title=".env"
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_DATABASE=alata
+DB_USERNAME=postgres
+DB_PASSWORD=secret
+```
+
+The driver comes from `DB_CONNECTION`, which defaults to `pgsql` — an accepted alias for `postgres`, so a fresh project targets PostgreSQL without setting anything. To use another database, set it explicitly:
+
+```bash title=".env"
+DB_CONNECTION=mysql   # or: postgres, pgsql, sqlite
+```
+
+During boot, `CONNECTIONS` and `DB_CONFIG` are loaded into the config repository as `database.connections` and `database.config`, so any code can read them through the [service container](/docs/architecture/container):
+
+```python
+from alata.container import container
+
+connections = container.make("config").get("database.connections")
+```
+
+### URL building
+
+You never write a connection string by hand. The provider passes each connection's config dict to `alata.db.url.build_urls()`, which assembles **two** SQLAlchemy URLs per connection — one sync, one async — based on the `driver` key:
+
+| `driver` | Sync URL scheme | Async URL scheme |
+| --- | --- | --- |
+| `postgres` / `postgresql` | `postgresql+psycopg2` | `postgresql+asyncpg` |
+| `mysql` | `mysql+pymysql` | `mysql+aiomysql` |
+| `sqlite` | `sqlite` | `sqlite+aiosqlite` |
+
+Usernames and passwords are URL-encoded automatically, so credentials containing `@`, `:`, or other special characters just work. For SQLite, the `database` key is treated as a file path (defaulting to `:memory:`).
+
+### Dialect support
+
+- **PostgreSQL** is the primary dialect — the best-tested target, and the only one with [advisory-lock migrations](/docs/database/migrations#postgresql-first-execution) and PostgreSQL-specific features like `ilike`, targeted upserts, and `distinct_on()`.
+- **MySQL 8.0+** is supported: the framework's database test suite runs green on MySQL 8.4. [`distinct_on()`](/docs/database/query-builder#distinct) is unavailable (it raises `NotImplementedError`), and the [migrator degrades gracefully](/docs/database/migrations#postgresql-first-execution) — no transactional DDL, no advisory lock.
+- **SQLite** is wired throughout — URL building, migrations, dialect-aware identifier quoting — and suits lightweight and development use.
+
+### Sync and async engines
+
+Every named connection gets **both** a sync engine and an async engine, each with its own session factory. The async engine serves your HTTP endpoints through the `a`-prefixed query API; the sync engine serves the CLI, migrations, and workers. Both are initialized once at boot and shared for the life of the process.
+
+Pool tuning keys (`pool_size`, `max_overflow`, `pool_pre_ping`, `pool_recycle`, `echo`) are passed straight through to SQLAlchemy's engine factory, so you can tune each connection independently.
+
+## Multiple connections
+
+To talk to a second database, add another entry to `CONNECTIONS`:
+
+```python title="config/database.py"
+CONNECTIONS = {
+    "default": { ... },
+    "reporting": {
+        "driver": "postgres",
+        "host": settings.REPORTING_DB_HOST,
+        "port": 5432,
+        "database": "reporting",
+        "username": settings.REPORTING_DB_USERNAME,
+        "password": settings.REPORTING_DB_PASSWORD,
+        "pool_size": 2,
+        "max_overflow": 5,
+    },
+}
+```
+
+Each connection gets its own engines, session factories, and pool metrics. Route queries to it with `DB.connection()`:
+
+```python
+from alata.db import DB
+
+rows = DB.connection("reporting").select("SELECT * FROM sales WHERE year = :y", {"y": 2026})
+rows = DB.connection("reporting").table("sales").where("year", 2026).get()
+```
+
+Models can also pin themselves to a connection with `__connection__ = "reporting"` — see [Models](/docs/database/models).
+
+## The DB facade
+
+For raw SQL and transactions, import the `DB` facade:
+
+```python
+from alata.db import DB
+```
+
+### Raw selects
+
+`DB.select()` runs a raw SELECT with named bind parameters and returns a list of dicts:
+
+```python
+rows = DB.select("SELECT * FROM users WHERE id = :id", {"id": 1})
+# [{"id": 1, "name": "Alice", ...}]
+```
+
+In async code, use `aselect`:
+
+```python
+rows = await DB.aselect("SELECT * FROM users WHERE email = :email", {"email": email})
+```
+
+### Raw statements
+
+`DB.statement()` runs a raw INSERT/UPDATE/DELETE and returns the affected row count. `astatement` is the async form:
+
+```python
+deleted = DB.statement("DELETE FROM sessions WHERE expired_at < NOW()")
+deleted = await DB.astatement("DELETE FROM sessions WHERE expired_at < NOW()")
+```
+
+<Callout type="warn">
+Always pass user input through the `params` dict — never interpolate it into the SQL string. Bind parameters are sent to the driver separately, which is what keeps raw queries injection-safe.
+</Callout>
+
+### Fluent table access
+
+`DB.table()` returns a lightweight query builder that works on any table without a model class — handy for pivot tables, admin tooling, and migrations. It is covered in full on the [Query Builder](/docs/database/query-builder#raw-table-queries-dbtable) page:
+
+```python
+DB.table("users").where("age", ">", 18).order_by("name").get()
+```
+
+### Scoped facade methods
+
+Everything above also exists on the connection proxy, scoped to that connection: `DB.connection("reporting").select(...)`, `.statement(...)`, `.aselect(...)`, `.astatement(...)`, `.table(...)`, and the transaction methods below.
+
+## Transactions
+
+### Context-managed transactions
+
+The simplest way to run work atomically is the transaction context manager. It commits on success and rolls back on any exception:
+
+```python
+from alata.db import DB
+
+with DB.transaction():
+    account.save()
+    AuditLog.create({"action": "transfer", "amount": amount})
+```
+
+The async counterpart is `atransaction`:
+
+```python
+async with DB.atransaction():
+    await account.asave()
+    await AuditLog.acreate({"action": "transfer", "amount": amount})
+```
+
+While a transaction is open, every query in the same context that targets that connection automatically runs on the transaction's session — you don't pass the session around.
+
+### Nesting
+
+Transactions nest. An inner `DB.transaction()` opens a **savepoint** on the outer session, so the outer transaction stays atomic: if the inner block raises, only the savepoint rolls back; if the outer block raises, everything does.
+
+```python
+with DB.transaction():
+    order.save()
+    try:
+        with DB.transaction():          # savepoint
+            apply_optional_discount(order)
+    except DiscountError:
+        pass                            # inner work undone, order.save() intact
+```
+
+### Per-connection transaction stacks
+
+Transaction state is tracked in a per-context stack **keyed by connection name**. A transaction opened on `default` never captures queries that target `reporting`, and vice versa. To run a transaction on a named connection, scope it:
+
+```python
+with DB.connection("reporting").transaction():
+    Report.create({...})
+```
+
+Because the stacks live in context-local storage, concurrent requests and tasks each get their own independent transaction state.
+
+### Manual transactions
+
+When a context manager doesn't fit the control flow, drive the transaction yourself:
+
+```python
+DB.begin_transaction()
+try:
+    ...
+    DB.commit()
+except Exception:
+    DB.rollback()
+    raise
+```
+
+The async trio is `abegin_transaction` / `acommit` / `arollback`:
+
+```python
+await DB.abegin_transaction()
+try:
+    ...
+    await DB.acommit()
+except Exception:
+    await DB.arollback()
+    raise
+```
+
+<Callout type="info">
+`commit()` and `rollback()` fully release the transaction level opened by `begin_transaction()` — the session is popped from the stack and its connection returned to the pool. They are no-ops if no manual transaction is open. The same methods exist per connection via `DB.connection("name").begin_transaction()` and friends.
+</Callout>
+
+## Beyond the builder: SQLAlchemy access
+
+Because the whole layer is SQLAlchemy 2.0 underneath, you can always drop one level down without leaving the framework — same engines, same pools, same transaction state. This is the sanctioned path for queries the fluent API cannot express.
+
+`get_session()` and `get_async_session()` hand you a plain SQLAlchemy session bound to any named connection:
+
+```python
+import sqlalchemy as sa
+from alata.db import get_session, get_async_session
+
+with get_session() as session:                    # sync, default connection
+    rows = session.execute(sa.text("SELECT ...")).all()
+
+async with get_async_session("reporting") as session:
+    rows = (await session.execute(sa.text("SELECT ..."))).all()
+```
+
+`DB.transaction()` yields the transaction's session, so framework writes and hand-written SQLAlchemy calls compose in one atomic unit — everything commits or rolls back together:
+
+```python
+from alata.db import DB
+
+with DB.transaction() as session:
+    account.save()                                                   # framework write
+    session.execute(sa.text("REFRESH MATERIALIZED VIEW balances"))   # raw SQL, same transaction
+```
+
+Every model exposes its SQLAlchemy `Table` as `Model.__table__` — the raw material for Core statements:
+
+```python
+users = User.__table__
+stmt  = sa.select(users.c.id, users.c.email).where(users.c.age > 18)
+```
+
+To run a hand-built statement and get **model instances** back, bridge through the query builder's [`from_statement()`](/docs/database/query-builder#dropping-to-sqlalchemy) — entity-shaped rows hydrate into models via `Model.hydrate()`, anything else comes back as dict rows.
+
+<Callout type="warn">
+Below the builder, the model layer's conveniences stop: global scopes (including soft-delete filtering) are not applied, no model events fire, and attribute casts only run if you rehydrate through `Model.hydrate()` / `from_statement()`. Drop down deliberately.
+</Callout>
+
+## Connection pool observability
+
+Every engine's pool can report live metrics. From code:
+
+```python
+from alata.db import DB
+
+DB.pool_status()             # default connection
+DB.pool_status("reporting")  # named connection
+DB.pool_status_all()         # every registered connection
+```
+
+`pool_status()` returns a dict with `pool_size`, `max_overflow`, `checked_out`, `checked_in`, `overflow`, `total_connections`, `max_capacity`, and `utilization_pct`.
+
+The framework also installs pool event listeners at boot: you get a WARNING log when a pool passes 80% utilization and an ERROR when it is fully exhausted. If a checkout times out because the pool is drained, the raw driver error is wrapped in a `ConnectionPoolExhaustedError` whose message includes the live metrics and points you at the `pool_size` / `max_overflow` knobs in `config/database.py`.
+
+### The db:status command
+
+For a quick look from the terminal, run:
+
+```bash
+./alata db:status
+```
+
+It boots only the database layer (fast — no app providers) and renders each connection with a health badge, a visual capacity bar, and the full metric breakdown:
+
+```text
+  ⚡ Database Connection Pool Status
+
+  default  HEALTHY
+  ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  10.0%
+
+    ├─ Pool Size     5 base + 10 overflow (max 15)
+    ├─ Checked Out   1
+    ├─ Checked In    4
+    ├─ Overflow      0
+    └─ Total Active  5
+```
+
+## Graceful shutdown
+
+You never dispose engines yourself. During application shutdown the database provider calls `dispose_engines()`, which drains and disposes every registered engine — async first, then sync — and clears the registries. Pools are emptied cleanly instead of dropping connections mid-flight, and a failure to dispose one engine never aborts the shutdown of the rest.
+
+## Next steps
+
+With connections configured, head to the [Query Builder](/docs/database/query-builder) for the full fluent query API, or [Models](/docs/database/models) to define your first table-backed class.

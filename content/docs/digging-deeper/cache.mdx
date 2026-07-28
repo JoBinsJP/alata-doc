@@ -1,0 +1,187 @@
+---
+title: Cache
+description: A Redis-backed cache facade with TTLs, atomic locks, cache-aside helpers, and graceful degradation.
+icon: Gauge
+---
+
+Alata ships a cache layer with a pluggable store behind a single facade. The default store is Redis, wired up by the framework's providers at boot — your application code just imports `Cache` and calls it, in async or sync contexts alike.
+
+```python
+from alata.cache import Cache
+
+await Cache.put("greeting", "hello", ttl=300)
+value = await Cache.get("greeting")   # "hello"
+await Cache.forget("greeting")
+```
+
+## Configuration
+
+Cache configuration lives in `config/cache.py`:
+
+```python title="config/cache.py"
+from config.settings import settings
+
+CACHE_CONFIG = {
+    # Default store driver. Override via CACHE_STORE env var.
+    "default": getattr(settings, "CACHE_STORE", "redis"),
+    # Global key prefix — prevents collisions when multiple apps share Redis.
+    "prefix": getattr(settings, "CACHE_PREFIX", "alata_cache:"),
+}
+```
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `default` | `redis` | The store driver: `redis` or `null` (no-op). |
+| `prefix` | `alata_cache:` | Prepended to every key. Lets multiple apps share one Redis safely. |
+| `strict_locking` | `True` | Whether lock acquisition fails when Redis is down (see [Locks](#atomic-locks)). |
+| `async_client_binding` | — | Optional container binding name whose async Redis client the cache should reuse. |
+
+At boot, `CacheProvider` builds the configured store and binds it in the [service container](/docs/architecture/container) as `cache`. The Redis store wraps two clients resolved from the container: the sync client `redis.cache` and the async client `redis.cache.async` — both registered by the Redis provider from your `config/redis.py` (see [Named Redis connections](#named-redis-connections)). It also tries to resolve a dedicated `redis.lock` connection so lock traffic never competes with cache traffic; if you haven't configured one, locks share the cache connection.
+
+<Callout type="info">
+The cache degrades gracefully. If Redis is unreachable — at boot or mid-flight — reads return `None`, writes are silent no-ops, and the failure is logged at debug level. If *no* Redis client can be built at boot, the provider falls back to a no-op store entirely. Your app keeps serving; it's just slower.
+</Callout>
+
+## The Cache API
+
+`Cache` stores **string values**. Every method has an async form (primary) and, for the common operations, a `_sync` twin for CLI commands and other synchronous contexts.
+
+### Retrieving and storing
+
+```python
+# Read — returns None on a miss, or your default
+value = await Cache.get("stats:daily")
+value = await Cache.get("stats:daily", default="0")
+
+# Write — ttl is in seconds; None means no expiry
+await Cache.put("stats:daily", "42", ttl=3600)
+await Cache.put("config:banner", "on")          # no expiry
+
+# Existence and removal
+if await Cache.has("stats:daily"):
+    ...
+await Cache.forget("stats:daily")
+```
+
+<Callout type="warn">
+A non-positive `ttl` is not "expire immediately" — the write is silently skipped. Pass `ttl=None` for a key that should live forever.
+</Callout>
+
+### Cache-aside with `remember`
+
+`remember` returns the cached value if present, otherwise runs your callback, stores the result, and returns it. The callback may be sync or async:
+
+```python
+async def fetch_dashboard(user_id: str) -> dict:
+    return await Cache.remember(
+        f"dashboard:{user_id}",
+        ttl=300,
+        callback=lambda: build_dashboard(user_id),  # sync or async
+    )
+```
+
+By default `remember` serializes with `json.dumps` and deserializes with `json.loads`, so dicts and lists round-trip transparently: you get the structured object back on both cache hits and misses. Pass your own `serializer`/`deserializer` pair for other types. A callback returning `None` is not cached.
+
+### Bulk removal
+
+```python
+# Delete every key under a prefix (the global prefix is applied on top)
+deleted = await Cache.forget_by_prefix("dashboard:user123:")
+
+# Clear the whole store
+await Cache.flush()
+```
+
+When a global key prefix is configured, `flush` scans and deletes only your app's prefixed keys — it will not wipe another application's data on a shared Redis.
+
+### Atomic locks
+
+`Cache.lock` acquires a distributed lock atomically (SET NX EX) and returns an **owner token**, or `None` if the lock is already held. Pass the token back to `unlock` so you only ever release your own lock — the release is an atomic compare-and-delete, immune to the race where your TTL expires and another process acquires the lock between check and delete:
+
+```python
+token = await Cache.lock("reports:rebuild", ttl=60)
+if token is None:
+    return  # someone else is doing it
+
+try:
+    await rebuild_reports()
+finally:
+    await Cache.unlock("reports:rebuild", owner=token)
+```
+
+The `strict_locking` config key decides what happens when Redis is unavailable: with `True` (the default) `lock` returns `None` — acquisition fails, so uncoordinated concurrent execution is impossible; with `False` it returns a synthetic token and lets the operation proceed, which suits idempotent work like scheduling mutexes.
+
+### Sync variants
+
+For code that runs outside an event loop — [console commands](/docs/digging-deeper/console), for instance — the facade exposes sync twins backed by the sync Redis client:
+
+```python
+value = Cache.get_sync("key")
+Cache.put_sync("key", "value", ttl=300)
+Cache.forget_sync("key")
+Cache.has_sync("key")
+Cache.forget_by_prefix_sync("dashboard:")
+```
+
+### Named stores
+
+`Cache.store(name)` resolves an alternative store registered in the container under `cache.<name>`. The framework registers `cache.null` (a no-op store) out of the box; bind your own in a provider to add more. Requesting an unregistered name raises `CacheStoreNotConfiguredError`, whose message lists the stores that *are* available.
+
+```python
+store = Cache.store("null")
+await store.put("ignored", "value")
+```
+
+### Testing
+
+Swap the facade's store without touching the container:
+
+```python
+Cache.fake()        # NullCacheStore — all reads miss, writes vanish
+Cache.fake_dict()   # DictCacheStore — in-memory with real TTLs, for asserting values
+Cache.restore()     # back to the real store
+```
+
+```python
+def test_caches_dashboard():
+    fake = Cache.fake_dict()
+    try:
+        ...
+        assert fake.get_sync("dashboard:u1") is not None
+    finally:
+        Cache.restore()
+```
+
+## Key prefixing
+
+The Redis store prepends `CACHE_CONFIG["prefix"]` (default `alata_cache:`) to every key. Your code always works with logical keys — `Cache.get("stats:daily")` reads `alata_cache:stats:daily` from Redis. The prefix applies to `forget_by_prefix` too, and scopes `flush` to your own keys.
+
+## Named Redis connections
+
+The cache rides on the framework's Redis provider, which is useful in its own right. `config/redis.py` declares named connections:
+
+```python title="config/redis.py"
+from config.settings import settings
+
+CONNECTIONS = {
+    "default": {"url": settings.REDIS_URL},
+    "cache":   {"url": settings.REDIS_CACHE_URL or settings.REDIS_URL},
+    "queue":   {"url": settings.REDIS_QUEUE_URL or settings.REDIS_URL},
+}
+```
+
+For each entry, `RedisProvider` registers two lazy container singletons:
+
+- `redis.<name>` — a sync client (`decode_responses=True`), pinged at first resolution; resolves to `None` if Redis is unreachable.
+- `redis.<name>.async` — an async client that connects lazily on first command.
+
+```python
+from alata.container import container
+
+redis = container.make("redis.default.async")
+await redis.sadd("online", user_id)
+```
+
+Connections that share a URL are **deduplicated**: when `REDIS_CACHE_URL` is unset and falls back to `REDIS_URL`, `redis.cache` is an alias for the same physical client as `redis.default` — no wasted connections. On application shutdown the provider closes every client that was actually resolved.
+
+Add your own entries — for example a dedicated `"lock"` connection, which the cache provider picks up automatically for lock traffic — and they become `redis.lock` / `redis.lock.async` with no further wiring.

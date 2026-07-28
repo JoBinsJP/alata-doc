@@ -1,0 +1,5 @@
+{
+  "title": "The Basics",
+  "icon": "BookOpen",
+  "pages": ["routing", "requests", "middleware", "error-handling", "logging"]
+}

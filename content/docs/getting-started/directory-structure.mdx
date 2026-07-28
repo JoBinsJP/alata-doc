@@ -1,0 +1,130 @@
+---
+title: Directory Structure
+description: What every directory in a scaffolded Alata project is for.
+icon: ListTree
+---
+
+A scaffolded Alata project has a deliberate layout: your code lives in `app/`, the kernel in `bootstrap/`, configuration in `config/`, and everything else in a purpose-named top-level directory. This page walks through each one.
+
+## The full tree
+
+```
+my-app/
+├── alata                     # console entry point — ./alata <command>
+├── main.py                   # uvicorn entry point — main:app
+├── Makefile                  # developer commands (serve, migrate, worker, test, ...)
+├── pyproject.toml
+├── .env.example
+├── app/
+│   ├── console/
+│   │   └── kernel.py         # custom CLI commands + the schedule
+│   ├── events/               # event listeners
+│   ├── exceptions/
+│   │   └── handler.py        # app-level exception handler
+│   ├── http/
+│   │   ├── controllers/      # request handlers
+│   │   ├── dependencies.py   # reusable route dependencies
+│   │   └── middleware.py     # custom HTTP middleware
+│   ├── models/               # database models
+│   ├── providers/            # your service providers
+│   ├── services/             # domain / business logic
+│   └── tasks/                # queue task definitions
+├── bootstrap/
+│   ├── application.py        # builds the ONE application kernel
+│   ├── app.py                # exposes the FastAPI instance for ASGI servers
+│   ├── broker.py             # exposes the taskiq broker for workers
+│   └── providers.py          # ordered provider registration lists
+├── config/
+│   ├── settings.py           # pydantic Settings — typed .env access
+│   ├── database.py           # connections + pool tuning
+│   ├── logging.py            # log channels (stack, console, file, json, sentry, ...)
+│   ├── queue.py              # taskiq broker + retry settings, queue names
+│   ├── redis.py              # named Redis connections
+│   ├── cache.py              # cache store + key prefix
+│   ├── filesystem.py         # storage disks (local, s3)
+│   └── middleware.py         # CORS, gzip, trusted hosts, request logging, maintenance
+├── database/
+│   └── migrations/           # timestamped schema migrations
+├── routes/
+│   └── api.py                # route definitions (APIRouter)
+├── storage/
+│   ├── framework/            # runtime files (maintenance flag, local disk)
+│   └── logs/                 # daily-rotated application logs
+└── tests/
+    └── test_api.py           # starter test hitting the welcome route
+```
+
+## The root files
+
+### `alata`
+
+The console entry point. `./alata <command>` boots the application kernel from `bootstrap/application.py` and hands off to the console kernel, which registers the full command set — `migrate`, `make:*`, `queue:*`, `schedule:*`, `serve`, `down`/`up`, and any commands your providers add. Run `./alata list` to see everything.
+
+The script auto-detects `.venv/bin/python` and re-executes itself with it, so it works without activating the virtualenv.
+
+### `main.py`
+
+A thin uvicorn entry point that imports the FastAPI app from `bootstrap/app.py`. `python main.py` starts a reloading dev server; deployment tools can target `main:app` or `bootstrap.app:app` interchangeably.
+
+### `Makefile`
+
+Shortcuts for the common loop: `make install`, `make serve`, `make migrate`, `make worker`, `make test`, `make down` / `make up`. Every target delegates to `./alata` or the venv's tooling.
+
+## `app/` — your application
+
+Everything you write lives here.
+
+- **`app/console/kernel.py`** — your `AppKernel` subclass of the console kernel. Register custom CLI commands in `register_user_commands()` and define the [scheduled tasks](/docs/digging-deeper/scheduling) in `schedule()`. The template already schedules `queue:prune-orphans` hourly.
+- **`app/events/`** — event listeners for the [event system](/docs/digging-deeper/events).
+- **`app/exceptions/handler.py`** — your `Handler` subclass of the framework's exception handler. Configure `dont_report` (exceptions that should not be logged) and register custom `renderable` / `reportable` callbacks. See [error handling](/docs/basics/error-handling).
+- **`app/http/`** — controllers, route dependencies, and middleware. The template ships a `WelcomeController`, an `IdentityMiddleware` that resolves the acting user from `X-User-Id` / `X-Guest-Id` headers, and `require_authenticated` / `get_user_id` dependencies.
+- **`app/models/`** — your [database models](/docs/database/models).
+- **`app/providers/`** — your [service providers](/docs/architecture/providers). `./alata make:provider` scaffolds one here and registers it for you. A `*_provider.py` file that exists here but is not declared in `bootstrap/providers.py` triggers a startup warning — providers are never auto-loaded.
+- **`app/services/`** — plain Python domain logic, typically bound into the container by a provider.
+- **`app/tasks/`** — [queue task](/docs/digging-deeper/queues) definitions. The worker discovers tasks matching `app/tasks/*_tasks.py`.
+
+## `bootstrap/` — the kernel
+
+This directory holds the single application kernel that every process shares.
+
+- **`application.py`** — constructs `Application(base_path=..., providers=[...])`. This is the one place the kernel is built; the console script, the ASGI entry point, and the worker broker all import it.
+- **`app.py`** — exposes `app = kernel.fastapi` so ASGI servers (`uvicorn bootstrap.app:app`) serve the same kernel.
+- **`broker.py`** — imports the application (booting it fully) and exposes `broker = app.make("queue.broker")` for the taskiq worker CLI. Workers therefore start with initialized database engines and every other registered service — no worker-specific boot code.
+- **`providers.py`** — the explicitly ordered provider lists: `FRAMEWORK_PROVIDERS` (redis, events, queue, cache, health, storage), `PROVIDERS` (yours), and `APP_KERNEL_PROVIDERS` (providers wired directly into `application.py`).
+
+## `config/` — configuration modules
+
+Plain Python modules, one per concern, loaded into the config repository during boot Phase 0. `config/settings.py` is the typed source of truth for environment variables; the other modules build declarative dicts from it. Covered in depth on the [configuration page](/docs/getting-started/configuration).
+
+## `database/`
+
+`database/migrations/` holds timestamped migration files (`2025_01_01_000000_create_users_table.py`). Generate new ones with `./alata make:migration` and run them with the [`./alata migrate` family](/docs/database/migrations). The template ships migrations for `users`, `job_batches`, and `failed_jobs`.
+
+## `routes/`
+
+Route definitions, separated from controller logic. `routes/api.py` builds an `APIRouter` (the template uses an `/api/v1` prefix) and the HTTP provider includes it during boot. See [routing](/docs/basics/routing).
+
+## `storage/`
+
+Runtime files written by the framework:
+
+- **`storage/framework/`** — the local filesystem disk (`storage/framework/filesystem`) and the maintenance-mode flag file (`storage/framework/down`, managed by `./alata down` / `./alata up`).
+- **`storage/logs/`** — the `file` log channel writes daily-rotated files here (`app-2026-07-28.log`).
+
+## `tests/`
+
+Your test suite. The starter `test_api.py` boots the app through the ASGI entry point with a test client and asserts on the welcome route — a working template for your own tests.
+
+## Resolving project paths
+
+The framework is installed into site-packages, so it can never locate your project's directories from its own `__file__`. Instead, `alata.support.paths.base_path()` resolves the project root from the running application's `base_path` (falling back to the current working directory):
+
+```python
+from alata.support.paths import base_path
+
+base_path()                                  # /path/to/my-app
+base_path("storage", "logs")                 # /path/to/my-app/storage/logs
+base_path("database", "migrations")          # /path/to/my-app/database/migrations
+```
+
+Use it whenever your code needs a path inside the project root — it stays correct across the HTTP server, the console, and workers.

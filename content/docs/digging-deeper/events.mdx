@@ -1,0 +1,209 @@
+---
+title: Events
+description: Decouple your application with an async event bus — events, listeners, subscribers, and queued handlers.
+icon: Zap
+---
+
+Alata's event bus lets one part of your application announce that something happened while other parts react to it — without either side knowing about the other. A central `Dispatcher` lives in the [container](/docs/architecture/container) as the `events` singleton; you define plain-dataclass events, register listeners for them, and dispatch.
+
+## Defining events
+
+An event is a dataclass extending the `Event` base from `alata.events.contracts`. It is a pure data carrier — no logic:
+
+```python title="app/events/order_shipped.py"
+from dataclasses import dataclass
+
+from alata.events.contracts import Event
+
+from app.models.order import Order
+
+
+@dataclass
+class OrderShipped(Event):
+    order: Order
+    carrier: str = "default"
+```
+
+## Defining listeners
+
+A listener extends `Listener` and implements an async `handle()` method:
+
+```python title="app/events/listeners/send_shipment_notification.py"
+from alata.events.contracts import Listener
+
+from app.events.order_shipped import OrderShipped
+
+
+class SendShipmentNotification(Listener):
+    async def handle(self, event: OrderShipped) -> None:
+        await notify(event.order.customer_email, f"Shipped via {event.carrier}")
+```
+
+Listeners don't have to be classes — any callable works, including plain async functions and bound methods:
+
+```python
+async def log_shipment(event: OrderShipped) -> None:
+    logger.info(f"Order {event.order.id} shipped")
+```
+
+<Callout type="info">
+Synchronous callables are supported too: the dispatcher runs them in a thread executor so they never block the event loop. Prefer async listeners for anything that does I/O.
+</Callout>
+
+## Registering listeners
+
+Wire events to listeners in a [service provider's](/docs/architecture/providers) `boot()` hook, where all container bindings are available:
+
+```python title="app/providers/app_provider.py"
+from alata.support.service_provider import ServiceProvider
+
+from app.events.order_shipped import OrderShipped
+from app.events.listeners.send_shipment_notification import SendShipmentNotification
+
+
+class AppProvider(ServiceProvider):
+    def boot(self) -> None:
+        dispatcher = self.app.make("events")
+        dispatcher.listen(OrderShipped, SendShipmentNotification)
+        dispatcher.listen(OrderShipped, log_shipment)
+```
+
+You can also register through the static `Event` facade, which resolves the same dispatcher from the container:
+
+```python
+from alata.events.facade import Event
+
+Event.listen(OrderShipped, SendShipmentNotification)
+```
+
+### Wildcard listeners
+
+Register a listener under the string `"*"` to receive **every** event — useful for audit trails and debugging. Wildcard listeners run after the event's specific listeners:
+
+```python
+dispatcher.listen("*", audit_everything)
+```
+
+## Dispatching events
+
+Dispatch is async — await it from a route handler, a queue task, or anywhere an event loop is running:
+
+```python
+from alata.events.facade import Event
+
+from app.events.order_shipped import OrderShipped
+
+
+async def ship_order(order):
+    ...
+    await Event.dispatch(OrderShipped(order=order, carrier="DHL"))
+```
+
+By default listeners execute **sequentially in registration order**, so behavior is deterministic. When ordering doesn't matter and listeners are independent, run them concurrently:
+
+```python
+await Event.dispatch(OrderShipped(order=order), concurrent=True)
+```
+
+### Stopping propagation
+
+In sequential mode, a listener that returns exactly `False` halts the chain — no later listener runs for that event:
+
+```python
+class FraudCheck(Listener):
+    async def handle(self, event: OrderShipped) -> None | bool:
+        if await is_fraudulent(event.order):
+            return False  # stop SendShipmentNotification from running
+```
+
+<Callout type="warn">
+Stop propagation only applies in sequential mode. With `concurrent=True` all listeners are started together, so a `False` return value is ignored.
+</Callout>
+
+## Subscribers
+
+When one class needs to handle several related events, use a `Subscriber` — it registers its own handlers on the dispatcher:
+
+```python title="app/events/subscribers/audit_subscriber.py"
+from alata.events.contracts import Subscriber
+
+
+class AuditSubscriber(Subscriber):
+    def subscribe(self, events) -> None:
+        events.listen(OrderShipped, self.on_shipped)
+        events.listen(OrderCancelled, self.on_cancelled)
+
+    async def on_shipped(self, event: OrderShipped) -> None: ...
+    async def on_cancelled(self, event: OrderCancelled) -> None: ...
+```
+
+Register it in a provider with `dispatcher.subscribe(AuditSubscriber)` (a class or an instance both work), or via the facade with `Event.subscribe(AuditSubscriber)`.
+
+## Queued listeners
+
+Slow work — sending email, calling external APIs — belongs on the [queue](/docs/digging-deeper/queues), not in the request that dispatched the event. Mix in `ShouldQueue` and implement `queue_via()` to hand the work to a queue task:
+
+```python
+from alata.events.contracts import Listener, ShouldQueue
+
+from app.tasks.email_tasks import send_shipment_email_task
+
+
+class SendShipmentNotification(Listener, ShouldQueue):
+    queue = "emails"  # optional queue override
+
+    def queue_via(self, event: OrderShipped) -> tuple:
+        return (send_shipment_email_task, (event.order.id,), {})
+```
+
+`queue_via()` returns a `(task, args, kwargs)` tuple — the registered queue task to dispatch and the **serializable** arguments to pass it. The dispatcher pushes the message to the broker immediately and moves on; the listener body never runs in-process.
+
+<Callout type="warn">
+There is deliberately no automatic serialization of event objects — events often hold live model instances with session state that cannot survive a trip through the broker. Pass primitive identifiers (like `event.order.id`) and reload the model inside the task.
+</Callout>
+
+If the broker rejects the message (for example, Redis is down), the exception propagates to the dispatching caller so failures surface at dispatch time. Retries and dead-lettering are the worker's job.
+
+## Model events
+
+The ORM fires a generic `ModelEvent` through the event bus after every model mutation — `created`, `updated`, `saved`, and `deleted`. Listen for it to react to database changes anywhere in your app:
+
+```python
+from alata.events.model_event import ModelEvent
+
+
+async def invalidate_cache(event: ModelEvent) -> None:
+    if event.model_class == "User":       # class name of the mutated model
+        await cache.forget(f"user:{event.model.id}")
+
+dispatcher.listen(ModelEvent, invalidate_cache)
+```
+
+`ModelEvent` exposes the `model` instance, the `event_name` string, and convenience properties `model_class` and `table_name`.
+
+"Before" hooks (`creating`, `updating`, `saving`, `deleting`) are **not** broadcast on the bus — they stay local to the model as [`@hook` methods](/docs/database/models), because they can cancel the operation by returning `False`. Dispatch is also skipped entirely when no `ModelEvent` listener is registered, and fails safe in contexts without a running event loop (such as sync CLI commands).
+
+## Scheduler events
+
+The task scheduler emits lifecycle events you can observe like any other: `ScheduledTaskStarting`, `ScheduledTaskFinished`, `ScheduledTaskSkipped`, and `ScheduledTaskFailed`, all in `alata.events.scheduling`. See [task scheduling](/docs/digging-deeper/scheduling#hooks).
+
+## Testing
+
+Swap the real dispatcher for a fake that records events without executing listeners:
+
+```python
+from alata.events.facade import Event
+
+
+async def test_shipping_dispatches_event():
+    fake = Event.fake()
+
+    await ship_order(order)
+
+    fake.assert_dispatched(OrderShipped)
+    fake.assert_dispatched(OrderShipped, lambda e: e.carrier == "DHL")
+    fake.assert_dispatched_count(OrderShipped, 1)
+    fake.assert_not_dispatched(OrderCancelled)
+```
+
+The fake also offers `assert_dispatched_concurrently(...)` to verify the `concurrent=True` path and `reset()` to clear recorded events between assertions. For lower-level tests you can construct a `Dispatcher` directly, and `dispatcher.forget(EventClass)` / `dispatcher.flush()` remove listeners for isolation — `flush()` is called automatically by `container.flush()` in the test lifecycle.

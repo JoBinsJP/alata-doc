@@ -1,0 +1,195 @@
+---
+title: Logging
+description: Channel-based logging with console, file, JSON, Sentry, and Slack drivers behind one Log facade.
+icon: ScrollText
+---
+
+Alata's logging is built on Python's standard `logging` module, organized into named **channels**. A channel is a destination — the console, a rotating file, structured JSON, Sentry, a Slack webhook — and a **stack** channel fans one message out to several of them. You define channels once in `config/logging.py`, then write logs through the `Log` facade or plain module loggers.
+
+## Writing Log Messages
+
+The quickest way in is the `Log` facade:
+
+```python
+from alata.log_manager import Log
+
+Log.info("Search completed")
+Log.warning("Cache miss rate above 20%")
+Log.error("Payment gateway unreachable", exc_info=True)
+```
+
+`Log` exposes the full set of level methods — `debug`, `info`, `warning`, `error`, `critical`, and `exception` (which logs at error level with the current traceback attached). Messages go to the **default channel** from your config.
+
+`Log` is a lazy module attribute: importing it does no work, and the underlying `LogManager` singleton is created on first use. The same instance is bound in the [service container](/docs/architecture/container) as `"log"`, so it also resolves by name or by type hint:
+
+```python
+from alata.container import container, inject
+from alata.log_manager import LogManager
+
+log = container.make("log")
+
+
+@inject
+def handle(query: str, log: LogManager):
+    log.info(f"Handling {query}")
+```
+
+### Module Loggers
+
+For code you want attributed to its module in log output, use `get_logger`:
+
+```python
+from alata.log_manager import get_logger
+
+logger = get_logger(__name__)   # or get_logger() — auto-detects the caller
+logger.info("Report generated")
+```
+
+These are standard library loggers. During boot the log provider configures the `app` and `alata` package logger trees to route through your channels — so any logger named under your `app` package inherits the configured handlers automatically, while third-party libraries keep their own defaults and never pollute your output.
+
+<Callout type="info">
+This means the channel routing applies to loggers under the `app` and `alata` namespaces. If you log from a module outside those packages, use the `Log` facade (or `Log.channel(...)`) rather than `logging.getLogger(__name__)`.
+</Callout>
+
+## Configuring Channels
+
+`config/logging.py` defines a `LOG_CONFIG` dict: a default channel plus named channel definitions, all driven by environment variables via `config/settings.py`:
+
+```python title="config/logging.py"
+LOG_CONFIG = {
+    "default": settings.LOG_CHANNEL,          # LOG_CHANNEL env, default "stack"
+    "channels": {
+        "stack": {
+            "driver": "stack",
+            "channels": ["console", "file"],  # LOG_STACK_CHANNELS env
+            "level": settings.EFFECTIVE_LOG_LEVEL,
+        },
+        "console": {"driver": "console", "level": "DEBUG", "format": settings.LOG_FORMAT},
+        "file": {
+            "driver": "file",
+            "path": str(_LOG_DIR / "app.log"),
+            "rotation": "daily",
+            "max_days": 14,
+        },
+        "json":   {"driver": "json"},
+        "sentry": {"driver": "sentry", "dsn": settings.SENTRY_DSN, ...},
+        "slack":  {"driver": "slack", "url": settings.LOG_SLACK_WEBHOOK_URL, ...},
+        "null":   {"driver": "null"},
+    },
+}
+```
+
+Common `.env` knobs:
+
+```bash title=".env"
+LOG_CHANNEL=stack
+LOG_STACK_CHANNELS=console,file
+LOG_LEVEL=DEBUG
+```
+
+### Available Drivers
+
+| Driver | Destination |
+| --- | --- |
+| `console` | Stderr, with a configurable format string |
+| `file` | Log file with daily or size-based rotation |
+| `json` | Stderr as structured JSON — for cloud log collectors |
+| `sentry` | Error tracking via the Sentry SDK |
+| `slack` | A Slack incoming webhook |
+| `stack` | Fans out to a list of other channels |
+| `null` | Discards everything — useful in tests |
+
+Each channel definition takes a `level`; a message must clear both the channel's level and the handler's to be emitted.
+
+### The Stack Channel
+
+The default setup routes everything through `stack`, which simply combines other channels. Change `LOG_STACK_CHANNELS` to reshape it per environment — `console,file` in development, `json,sentry` in production — without touching code.
+
+### File Rotation
+
+With `"rotation": "daily"` (the default) the file channel writes one dated file per day — `storage/logs/app-2026-07-28.log` — and prunes files older than `max_days` (default 14). Rotation is multi-worker safe: each worker independently opens the current day's file. Set `"rotation"` to anything else to switch to size-based rotation using `max_bytes` and `backup_count`.
+
+## Writing to a Specific Channel
+
+`Log.channel(name)` returns the logger for a single named channel, bypassing the default:
+
+```python
+from alata.log_manager import Log
+
+Log.channel("slack").critical("Primary database failing over")
+Log.channel("file").debug("Cache warm took 3.2s")
+```
+
+Channels are resolved lazily and cached — the Slack webhook, for example, is only set up the first time the channel is used.
+
+## The Slack Channel
+
+The `slack` driver posts formatted attachments — level-colored, with the file, line, and timestamp — to a Slack incoming webhook, using only the standard library (no HTTP client dependency) and a 2-second timeout so a slow webhook can never hang a request.
+
+Configure it via settings:
+
+```bash title=".env"
+LOG_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+LOG_SLACK_USERNAME="Ops Bot"        # default: "Alata Bot"
+LOG_SLACK_EMOJI=":rotating_light:"  # default: ":robot_face:"
+LOG_SLACK_LEVEL=ERROR
+```
+
+The channel definition maps these through `url`, `username`, `emoji`, and `level` keys; a `footer` key is also supported for the attachment footer (default `"Alata"`). If `url` is unset the channel is silently disabled — safe to leave configured in every environment.
+
+<Callout type="warn">
+Keep the Slack channel's `level` at `ERROR` or above, and don't put it in your default stack at `INFO` — every message is an HTTP request to Slack.
+</Callout>
+
+## Formatting
+
+The `console` and `file` drivers accept a standard `logging` format string via the `format` key:
+
+```python
+"format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+```
+
+Setting the console channel's `format` to the literal string `"json"` switches it to the structured JSON formatter. The `json` driver (and Slack's internal detail formatting) emits records as:
+
+```json
+{"time": "2026-07-28T09:14:03+00:00", "level": "ERROR", "name": "app.services.billing",
+ "message": "Charge failed", "file": "billing.py", "line": 88, "environment": "production"}
+```
+
+When the record carries an exception, a formatted `exception` traceback field is included.
+
+## Per-Message Extra Context
+
+Attach structured data to a single message with the standard `extra` mechanism, under the `extra_data` key:
+
+```python
+Log.error(
+    "Charge failed",
+    extra={"extra_data": {"order_id": 42, "gateway": "stripe"}},
+)
+```
+
+The JSON formatter emits it as an `extra` field on the record, so your log pipeline can index and filter on it. Pass `exc_info=True` (or an exception instance) to include the traceback. This is exactly how the [exception handler](/docs/basics/error-handling) reports unhandled exceptions — message, `exc_info`, and merged context as `extra_data`.
+
+## Catching Exceptions in One Line
+
+The `log_exceptions` decorator wraps a sync or async function, logs any unhandled exception with its full traceback (reporting to Sentry when initialized), and re-raises:
+
+```python
+from alata.log_manager import log_exceptions
+
+
+@log_exceptions
+async def sync_inventory():
+    ...
+```
+
+HTTP exceptions pass through untouched — they belong to [error handling](/docs/basics/error-handling), not the log.
+
+## Sentry
+
+The `sentry` channel initializes the Sentry SDK with logging, HTTP-framework, and HTTP-client integrations: breadcrumbs are collected from `INFO`-level logs, and events are sent from the configured `level` (default `ERROR`) up. It is driven entirely by settings — `SENTRY_DSN`, sample rates, environment, and release (built from `APP_NAME`/`APP_VERSION`). When enabled, Sentry initializes even if it is not part of your stack channel, and Python warnings captured by the logging system are forwarded as Sentry messages too. If `sentry-sdk` isn't installed the channel logs a warning and disables itself.
+
+## Testing
+
+Point `LOG_CHANNEL` at `null` to silence logs in tests. If your test harness rebuilds the container between tests, `Log.reconfigure_root_logger()` forces a fresh handler setup so handlers don't duplicate across boots.

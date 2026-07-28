@@ -1,0 +1,81 @@
+---
+title: Welcome to Alata
+description: A batteries-included ASGI Python framework for building production applications.
+icon: Rocket
+full: true
+---
+
+Alata is a batteries-included ASGI Python framework. It gives you a service container, a provider-driven boot lifecycle, a configuration system, a database layer on SQLAlchemy 2.0, schema migrations, background queues on taskiq, cron-style scheduling, a console kernel, file storage, events, caching, and testing utilities — wired together so you can start on your application, not your plumbing.
+
+## Why Alata
+
+Modern Python gives you excellent building blocks — FastAPI for HTTP, SQLAlchemy for data, taskiq for background work — but assembling them into a coherent application is left as an exercise. Every project reinvents configuration loading, dependency wiring, worker bootstrapping, and migration tooling, and the pieces drift apart.
+
+Alata solves this with **one application kernel**. Your project builds a single `Application` in `bootstrap/application.py`, and every entry point — the HTTP server, the `./alata` console, the queue worker, the scheduler — loads that same kernel and shares the same service container. A service you register once is available everywhere, initialized exactly the same way.
+
+- **Service container & providers** — explicit, ordered service registration with `register()`, `boot()`, and `async_boot()` phases.
+- **Configuration** — plain Python modules in `config/`, typed pydantic settings from `.env`, dot-notation access everywhere.
+- **Database** — async and sync engines on SQLAlchemy 2.0, a query builder, models, and a `./alata migrate` family of commands. PostgreSQL-first.
+- **Queues** — taskiq brokers (Redis or SQS), retry middleware, batches, and failed-job tooling, plus the Horizon dashboard package.
+- **Scheduling** — cron expressions, `schedule:run`, overlap protection, and an `on_one_server` mutex for multi-instance deployments.
+- **Operations built in** — `/health` endpoints, maintenance mode, structured logging channels, and a central exception handler that fails closed in production.
+
+## Quick start
+
+Alata ships with a scaffolder that generates a complete, runnable project:
+
+```bash
+# Scaffold a new project (alata installs from the Git repository)
+uvx --from git+ssh://git@github.com/JoBinsJP/alata-core.git alata-new new my-app
+
+cd my-app
+cp .env.example .env    # point at your PostgreSQL and Redis
+uv sync                 # create .venv and install dependencies
+
+./alata migrate         # run the starter migrations
+./alata serve           # http://127.0.0.1:8000
+```
+
+Then check that it is alive:
+
+```bash
+curl http://127.0.0.1:8000/health
+# {"status": "ok"}
+```
+
+Head to the [installation guide](/docs/getting-started/installation) for the full walkthrough.
+
+## Explore the documentation
+
+<Cards>
+  <Card
+    title="Installation"
+    href="/docs/getting-started/installation"
+    description="Scaffold a new project, configure your environment, and boot the dev server."
+  />
+  <Card
+    title="Application Lifecycle"
+    href="/docs/architecture/lifecycle"
+    description="How the kernel boots: environment, configuration, and the provider phases."
+  />
+  <Card
+    title="Routing"
+    href="/docs/basics/routing"
+    description="Define routes and controllers and wire them into the HTTP kernel."
+  />
+  <Card
+    title="Database"
+    href="/docs/database/getting-started"
+    description="Connections, the query builder, models, and migrations on SQLAlchemy 2.0."
+  />
+  <Card
+    title="Queues"
+    href="/docs/digging-deeper/queues"
+    description="Background jobs on taskiq with retries, batches, and failed-job handling."
+  />
+  <Card
+    title="Horizon"
+    href="/docs/packages/horizon"
+    description="A dashboard and supervisor for your queue workers."
+  />
+</Cards>

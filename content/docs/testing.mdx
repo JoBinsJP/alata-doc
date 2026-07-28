@@ -1,0 +1,347 @@
+---
+title: Testing
+description: Test your Alata application with pytest, HTTP test cases, fluent JSON assertions, and per-test database rollbacks.
+icon: TestTube
+---
+
+Alata is built to be tested. The framework ships first-class testing utilities — an HTTP test case that drives your application through its real kernel, a fluent assertion API for JSON responses, and a database mixin that rolls back every test's writes — all designed to plug straight into pytest.
+
+## Getting Started
+
+Alata's testing tools build on [pytest](https://docs.pytest.org) and [pytest-asyncio](https://pytest-asyncio.readthedocs.io). A scaffolded project already includes them as dev dependencies, together with `httpx` (which powers the HTTP test client):
+
+```toml title="pyproject.toml"
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.25.0",
+    "httpx>=0.28.0",
+]
+```
+
+Enable pytest-asyncio's automatic mode so plain `async def` test functions run without decorating each one:
+
+```toml title="pyproject.toml"
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+```
+
+With `asyncio_mode = "auto"`, any async test function is collected and awaited automatically — no `@pytest.mark.asyncio` needed.
+
+### The conftest pattern
+
+Two things must happen **before** any application module is imported: the environment must be set to `testing`, and the database name must be overridden so tests can never touch your development data. Because pytest imports test modules (and anything they import — including `bootstrap.application`) during collection, do this at the very top of `tests/conftest.py`, before any other import:
+
+```python title="tests/conftest.py"
+import os
+
+# ── EARLY OVERRIDES — must run before any app module is imported ──────────
+os.environ.setdefault("APP_ENV", "testing")
+os.environ["DB_DATABASE"] = os.environ.get("TEST_DB_NAME", "myapp_test")
+
+import pytest  # noqa: E402
+
+from alata.container import container  # noqa: E402
+
+
+@pytest.fixture
+def fresh_container():
+    """A clean container for each test — flushed afterwards.
+
+    Does NOT boot providers, making it ideal for unit tests that
+    register their own fakes.
+    """
+    yield container
+    container.flush()
+
+
+@pytest.fixture
+def booted_container():
+    """Boot the full provider lifecycle, then flush after the test.
+
+    Use for integration-style tests that need real services
+    (logging, the queue broker, the database engine, ...).
+    """
+    from alata.application import boot
+
+    boot()
+    yield container
+    container.flush()
+```
+
+`container.flush()` resets everything on the active container: all singleton, factory, and instance bindings, the type map used for auto-injection, and the booted flag. The next test that calls `boot()` starts from a genuinely clean slate — no state leaks between tests.
+
+```python title="tests/test_container_wiring.py"
+def test_singleton_returns_same_instance(fresh_container):
+    fresh_container.singleton("svc", lambda: object())
+
+    assert fresh_container.make("svc") is fresh_container.make("svc")
+```
+
+<Callout type="info">
+The `container` handle you import is a call-time proxy to whichever container currently governs the process — the base container in module-level tests, or the `Application` once one is constructed. Flushing through the proxy always flushes the *active* container, which is exactly what you want in a teardown. See [service container](/docs/architecture/container) for how the proxy works.
+</Callout>
+
+## HTTP Tests
+
+`HttpTestCase` runs requests against your application's ASGI kernel in-process — no server, no sockets. Subclass it once per project and implement `get_application()`:
+
+```python title="tests/test_api_base.py"
+from typing import TYPE_CHECKING
+
+from alata.http.testing import HttpTestCase
+
+if TYPE_CHECKING:
+    from alata.application import Application
+
+
+class ApiTestCase(HttpTestCase):
+    def get_application(self) -> "Application":
+        from bootstrap.application import app
+
+        return app
+```
+
+Every test class that extends your `ApiTestCase` gets an `httpx.AsyncClient` wired to the kernel, plus async helper methods for each verb — `get`, `post`, `put`, `patch`, and `delete` — that each return a `TestResponse`:
+
+```python title="tests/test_users.py"
+class TestUsers(ApiTestCase):
+    async def test_index_lists_users(self):
+        response = await self.get("/api/v1/users")
+
+        response.assert_ok()
+
+    async def test_store_creates_a_user(self):
+        response = await self.post("/api/v1/users", json={"name": "Bedu"})
+
+        response.assert_created()
+```
+
+The helpers accept every keyword argument the underlying `httpx` client does — `json=`, `params=`, `headers=`, and so on. And because `TestResponse` transparently forwards unknown attributes to the wrapped `httpx.Response`, you can still read `response.status_code`, `response.headers`, or call `response.json()` directly whenever an assertion helper doesn't fit.
+
+### Response assertions
+
+All assertion methods return the `TestResponse`, so they chain:
+
+```python
+response.assert_ok().assert_json_structure({"users": {"*": ["id", "name"]}})
+```
+
+| Method | Asserts |
+| --- | --- |
+| `assert_status(code)` | The response has the given status code (failure messages include the body). |
+| `assert_ok()` | Status is `200`. |
+| `assert_created()` | Status is `201`. |
+| `assert_no_content()` | Status is `204`. |
+| `assert_json(callback)` | Fluent assertions against the JSON body (see below). |
+| `assert_json(exact={...})` | The decoded JSON body equals `exact` exactly. |
+| `assert_json_structure(structure)` | The body contains the given key structure. |
+| `assert_contents(*substrings)` | The (buffered) text body contains each substring. |
+| `assert_stream(*chunks)` | A streamed body equals the given content or exact chunk sequence. |
+| `assert_stream_contains(*substrings)` | The streamed content contains each substring. |
+
+### Asserting JSON structure
+
+`assert_json_structure` verifies that keys exist, without caring about values. Use a list for leaf keys, a dict to nest, and a `"*"` key to apply a structure to every element of a list:
+
+```python
+response.assert_json_structure({
+    "teams": {"*": ["name", "sport"]},
+})
+```
+
+### Fluent JSON assertions
+
+For value-level assertions, pass a callback to `assert_json`. The callback receives an `AssertableJson` scoped to the body:
+
+```python
+response.assert_json(lambda json: (
+    json.where("id", 1)
+        .where("name", "Bedu")
+        .where("active", lambda v: v is True)
+        .has("profile", lambda profile: (
+            profile.where("email", "a@b.com").etc()
+        ))
+        .etc()
+))
+```
+
+The full API:
+
+| Method | Asserts |
+| --- | --- |
+| `where(key, expected)` | `key` equals a literal value, or satisfies a predicate callable. |
+| `where_not(key, expected)` | `key` does *not* equal the value / pass the predicate. |
+| `where_all({key: expected, ...})` | Each pair, via `where`. |
+| `where_type(key, "string")` | `key` is one of the JSON type names `string`, `integer`, `double`, `number`, `boolean`, `array`, `object`, `null`. Accepts `"string\|null"` or a list. |
+| `where_all_type({key: type, ...})` | Each pair, via `where_type`. |
+| `where_contains(key, expected)` | The list (or string) at `key` contains `expected`. |
+| `has(key)` | `key` exists. |
+| `has(key, 3)` | `key` is a sized collection of length 3. |
+| `has(key, callback)` | Scope into `key` and run nested assertions. |
+| `has(key, 3, callback)` | Both length and a nested scope. |
+| `has_all("a", "b")` | Every key exists (also accepts a list). |
+| `has_any("a", "b")` | At least one key exists. |
+| `missing(key)` / `missing_all(...)` | The key(s) are absent. |
+| `count(key, n)` | The collection at `key` has exactly `n` items. |
+| `first(callback)` | Scope into the first child element. |
+| `each(callback)` | Run the callback against every child element in its own scope. |
+| `etc()` | Acknowledge any remaining, un-asserted keys in this scope. |
+
+Keys support dot notation for deep access, including list indexes — `where("meta.page", 1)` or `has("users.0.name")` both work.
+
+<Callout type="warn">
+The fluent API enforces a **strict interaction model**: when a scope closes, every property of the object must have been asserted against — otherwise the test fails with the list of unexpected keys. This catches responses that quietly grow extra fields. Call `.etc()` in a scope to opt out and acknowledge the remaining keys.
+</Callout>
+
+### Testing streamed responses
+
+Server-Sent Events endpoints get their own assertion family. `is_stream()` reports whether the response is `text/event-stream`, `stream_chunks()` returns the individual `data:` payloads, and `stream_content()` concatenates them:
+
+```python
+response = await self.post("/api/v1/chat", json={"message": "Hi"})
+
+# Assert the concatenated stream content:
+response.assert_stream("Hello there!")
+
+# Or assert the exact chunk sequence:
+response.assert_stream("Hello", " there!")
+
+# Or just look for substrings anywhere in the stream:
+response.assert_stream_contains("Hello")
+```
+
+`assert_stream` and `assert_stream_contains` fail fast if the response is not actually a stream — use `assert_contents` for buffered bodies.
+
+## Database Testing
+
+### Rolling back with `DatabaseTransaction`
+
+Add the `DatabaseTransaction` mixin to a test class and every test runs inside a database transaction that is rolled back afterwards — writes never persist between tests:
+
+```python title="tests/test_signup.py"
+from alata.db.testing import DatabaseTransaction
+
+from tests.test_api_base import ApiTestCase
+
+
+class TestSignup(DatabaseTransaction, ApiTestCase):
+    async def test_signup_creates_a_user(self):
+        response = await self.post("/api/v1/signup", json={
+            "name": "Bedu",
+            "email": "bedu@example.com",
+        })
+
+        response.assert_created()
+        # The INSERT above is rolled back when this test finishes.
+```
+
+Under the hood the mixin calls `DB.abegin_transaction()` in `asyncSetUp` and `DB.arollback()` in `asyncTearDown` — the same manual transaction API from the [database layer](/docs/database/getting-started), applied to the default connection.
+
+<Callout type="warn">
+List `DatabaseTransaction` **before** the HTTP test case in the base-class list, as shown above. Python's method resolution order then runs the HTTP client setup first and opens the transaction after it, and unwinds in the reverse order on teardown.
+</Callout>
+
+### A dedicated test database
+
+Rollbacks protect you within a run, but your tests should also point at their own database entirely. The early `DB_DATABASE` override in the [conftest pattern](#the-conftest-pattern) handles this: it patches the environment before `config/database.py` is ever imported, so every engine the test run builds connects to the test database. You can go further and prepare the schema once per session with the migrator:
+
+```python title="tests/conftest.py"
+def pytest_sessionstart(session):
+    """Fresh-migrate the test database before the suite runs."""
+    from alata.application import boot
+    from alata.container import container
+    from alata.db import get_engine
+    from alata.db.migrator import Migrator
+
+    boot()
+    Migrator(get_engine()).fresh()
+    container.flush()
+```
+
+`Migrator.fresh()` drops all tables and replays every migration from scratch, so the suite always starts from the exact schema your migrations describe.
+
+## Swapping Services with Fakes
+
+Because your code resolves services through the [container](/docs/architecture/container), tests can substitute implementations without patching imports. Bind an instance over the real binding and the entire application — routes, tasks, commands — sees the fake:
+
+```python
+class FakeMailer:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, to, subject, body):
+        self.sent.append((to, subject, body))
+
+
+async def test_signup_sends_welcome_mail(booted_container):
+    mailer = FakeMailer()
+    booted_container.instance("mailer", mailer)   # override the real binding
+
+    await register_user(name="Bedu", email="bedu@example.com")
+
+    assert len(mailer.sent) == 1
+```
+
+`container.instance()` registers a pre-built object, replacing whatever factory or singleton was bound under that name. The fixture's `container.flush()` teardown removes the fake afterwards.
+
+If you fake often, a tiny helper fixture keeps tests tidy:
+
+```python title="tests/conftest.py"
+@pytest.fixture
+def fake():
+    """Register fake bindings: fake("storage", MockStorage())."""
+    def _fake(name: str, factory_or_value) -> None:
+        if callable(factory_or_value):
+            container.bind(name, factory_or_value)
+        else:
+            container.instance(name, factory_or_value)
+
+    yield _fake
+    container.flush()
+```
+
+## Testing Queued Tasks
+
+Queued tasks are plain async functions under the decorator, so you can test their logic by calling them directly — the decorator's `__call__` invokes the original function without touching the broker:
+
+```python title="tests/test_email_tasks.py"
+from app.tasks.email_tasks import send_welcome_email
+
+
+async def test_welcome_email_builds_the_right_message(booted_container):
+    result = await send_welcome_email(user_id=1)   # runs inline, no broker
+
+    assert result["subject"] == "Welcome!"
+```
+
+To assert that code *dispatches* a task — without actually enqueueing anything — replace the task's `kiq` method with an `AsyncMock`:
+
+```python title="tests/test_signup_dispatch.py"
+from unittest.mock import AsyncMock, patch
+
+from app.services.registration import register_user
+from app.tasks.email_tasks import send_welcome_email
+
+
+async def test_signup_dispatches_welcome_email(booted_container):
+    with patch.object(send_welcome_email, "kiq", new=AsyncMock()) as kiq:
+        await register_user(name="Bedu", email="bedu@example.com")
+
+        kiq.assert_awaited_once_with(user_id=1)
+```
+
+The same approach works for console commands: they are ordinary classes, so instantiate the command, stub out any collaborators through the container, and call its logic directly.
+
+## Running the Suite
+
+```bash
+uv run pytest                 # the whole suite
+uv run pytest tests/test_users.py -v
+uv run pytest -k "signup"     # by keyword
+```
+
+<Callout type="info">
+Set `TEST_DB_NAME` in your environment (or CI) to control which database the suite targets — the conftest override above falls back to a `_test`-suffixed default so a plain `pytest` run is always safe.
+</Callout>
