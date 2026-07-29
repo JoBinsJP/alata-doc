@@ -26,11 +26,7 @@ Point uvicorn at the ASGI entry point:
 uvicorn bootstrap.app:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
-`main:app` is an equivalent target (`main.py` re-exports the same instance). The scaffolded `Makefile` wraps this as:
-
-```bash
-make serve-prod   # uvicorn bootstrap.app:app --host 0.0.0.0 --port $(PORT)
-```
+`main:app` is an equivalent target (`main.py` re-exports the same instance).
 
 You can also use the built-in serve command — reload is disabled automatically when `--workers` is greater than 1, or explicitly with `--no-reload`:
 

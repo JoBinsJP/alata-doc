@@ -117,10 +117,10 @@ The template ships three migrations: a `users` table, plus the `job_batches` and
 ### Boot the development server
 
 ```bash
-make serve
+./alata serve
 ```
 
-`make serve` runs `./alata serve --port 8001` — a uvicorn server with hot reload enabled. Run `./alata serve` directly if you prefer the default `127.0.0.1:8000`, and pass `--host`, `--port`, `--workers`, or `--no-reload` to tune it.
+`./alata serve` starts a uvicorn server on `127.0.0.1:8000` with hot reload enabled — pass `--host`, `--port`, `--workers`, or `--no-reload` to tune it.
 
 You can also start uvicorn yourself against the ASGI entry point:
 

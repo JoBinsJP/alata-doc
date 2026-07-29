@@ -277,7 +277,9 @@ event.payload["kind"]        # "signup" — dict, not a string
 event.started_at.year        # 2026 — datetime, parsed from the ISO string
 ```
 
-Supported cast types: `"json"` / `"list"` / `"dict"`, `"integer"` / `"int"`, `"float"`, `"boolean"` / `"bool"`, `"string"` / `"str"`, `"datetime"`, `"date"`.
+Supported cast types: `"json"` / `"list"` / `"dict"`, `"integer"` / `"int"`, `"float"`, `"decimal"`, `"boolean"` / `"bool"`, `"string"` / `"str"`, `"datetime"`, `"date"`.
+
+The `"decimal"` cast returns `decimal.Decimal` values on read and writes exact decimals to the database — the natural pairing for `NUMERIC` money and rate columns. Floats are converted through their string form, so `0.1` becomes `Decimal("0.1")` rather than the binary-float expansion.
 
 <Callout type="info">
 JSON casts are column-aware: on a native `JSON` column the dict/list is passed through untouched (what async drivers expect), while on a `TEXT` column it is serialized to a JSON string. You get the right behavior either way.

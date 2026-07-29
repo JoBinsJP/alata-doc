@@ -68,7 +68,7 @@ A thin uvicorn entry point that imports the FastAPI app from `bootstrap/app.py`.
 
 ### `Makefile`
 
-Shortcuts for the common loop: `make install`, `make serve`, `make migrate`, `make worker`, `make test`, `make down` / `make up`. Every target delegates to `./alata` or the venv's tooling.
+Environment tasks only: `make install`, `make test`, `make lint`, `make clean`. Everything runtime — serving, migrations, workers, maintenance mode — lives on the application console; run `./alata list` to see it all.
 
 ## `app/` — your application
 
