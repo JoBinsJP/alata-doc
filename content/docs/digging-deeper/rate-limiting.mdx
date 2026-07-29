@@ -4,7 +4,28 @@ description: Throttle HTTP routes and domain actions with a cache-backed fixed-w
 icon: Gauge
 ---
 
-Alata ships a rate limiter for two jobs: throttling HTTP routes (429s with proper headers) and limiting any domain action ("three OTP sends per five minutes"). Counters live on a [cache store](/docs/digging-deeper/cache) — any configured store works — and windows are fixed: the first hit of a window sets its expiry in the same store operation, so on an atomic backend like Redis concurrent requests can never create a bucket that never expires.
+Alata ships a fixed-window rate limiter for two jobs: throttling HTTP routes (429s with proper headers) and limiting any domain action ("three OTP sends per five minutes"). Counters live on a [cache store](/docs/digging-deeper/cache) — any configured store works — and windows are fixed: the first hit of a window sets its expiry in the same store operation, so on an atomic backend like Redis concurrent requests can never create a bucket that never expires.
+
+## The algorithm: a fixed window
+
+Alata counts attempts in a **fixed window**. The first attempt for a key opens a window, the counter increments on every attempt, and the whole counter disappears when the window expires. It is the same algorithm the mainstream web frameworks ship, and it is the right default: one counter per key, one round trip per decision, no per-request bookkeeping to store or prune.
+
+Its trade-off is worth knowing before you pick a number. A window is anchored to a key's first attempt, not to a wall clock, and it resets all at once — so traffic can cluster on either side of a reset:
+
+```text
+60/minute, window opened at t=0
+  t=59.5s   59 attempts   → allowed (fills the window)
+  t=60.0s   window expires
+  t=60.5s   60 attempts   → allowed (a fresh window)
+  ──────────────────────────────────────────────────
+  119 attempts inside a ~1 second span
+```
+
+Nothing is broken here — each window honored its own limit. But "60 per minute" bounds *a window*, not *any 60-second span*, and the worst case is close to twice the nominal rate. Size limits with that in mind: if a burst of 2× would hurt, set the limit at half what the endpoint can survive, or use a shorter window (`Limit.per_minutes(1, 60)` and `Limit.per_second(1)` bound the same average rate very differently).
+
+<Callout type="info">
+**When a fixed window is not enough.** A smoother shape — a sliding window, or a token bucket that refills continuously and allows a controlled burst — costs more state and more work per request. That belongs at the edge, in the API gateway or CDN that already sees every request, not in the application process. Use this limiter to protect *your* endpoints and domain actions; use the edge for traffic shaping.
+</Callout>
 
 ## How admission is decided
 
