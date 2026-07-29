@@ -120,6 +120,13 @@ names_by_id = await User.where("active", True).apluck("name", "id")
 # {1: "Alice", 2: "Bob", ...}
 ```
 
+Both work in [row mode](#selecting-specific-columns) too — after `select()` the rows are dicts, and the named key is read from them:
+
+```python
+User.where("id", 42).select("id", "name").value("name")     # "Alice"
+User.where("active", True).select("id", "age").pluck("age") # Collection([31, 27, ...])
+```
+
 ### Existence and counting
 
 ```python
@@ -163,6 +170,14 @@ Column strings support `"col"`, `"col as alias"`, and — after a [join](#joins)
 ```python
 rows = User.where("active", True).select("name").select_raw("upper(name) as shout").get()
 # [{"name": "Ada", "shout": "ADA"}, ...]
+```
+
+The alias is taken from the **last** ` as ` in the string, so expressions carrying their own `AS` survive intact, and a quoted alias becomes a clean dict key:
+
+```python
+User.select_raw("CAST(age AS text) as label")   # {"label": "42"} — the CAST is not split
+User.select_raw("CAST(age AS text)")            # no alias; the fragment is left whole
+User.select('age as "user age"')                # {"user age": 42}
 ```
 
 <Callout type="info">
@@ -233,6 +248,14 @@ latest_per_thread = (
 )
 ```
 
+`count()` honors both forms — it counts the de-duplicated rows, so a `paginate()` total always matches the number of rows the page query can actually return:
+
+```python
+q = User.where("active", True).select("age").distinct()
+len(q.get())   # 4 distinct ages
+q.count()      # 4 — not the raw row count
+```
+
 <Callout type="warn">
 `distinct_on()` is PostgreSQL-only — on any other dialect the query raises `NotImplementedError` when it is built. Use `distinct()` for portable de-duplication. For the "one row per group" pattern on other databases, reach for [`latest_of_many()` / `oldest_of_many()`](/docs/database/models#one-row-from-a-has-many-latest_of_many-and-oldest_of_many) on a relationship, or a `row_number()` window query via [`from_statement()`](#dropping-to-sqlalchemy).
 </Callout>
@@ -258,6 +281,12 @@ rows = (
     .get()
 )
 ```
+
+`count()`, `exists()`, and `paginate()` totals cover **every** part of the union — they wrap the compound select rather than counting the receiving builder's table alone.
+
+<Callout type="warn">
+**Keyset pagination is not available on a union.** `cursor_paginate()`, `chunk_by_id()`, and `lazy_by_id()` (plus their async twins) raise `NotImplementedError` on a union query. A keyset predicate is ANDed into the receiving builder's own select, so it never reaches the other parts — their rows would be served again on every page and the iteration would never terminate. Paginate each part separately and merge, or use offset pagination (`paginate()` / `chunk()`) over the union.
+</Callout>
 
 ## Where clauses
 
@@ -371,6 +400,13 @@ q = (
     User.where_raw("age > :min_age", {"min_age": 18})
         .where_raw("score > :min_score", {"min_score": 80})   # distinct names — OK
 )
+```
+
+Raw clauses inside a nested closure or a `where_has()` callback join the same namespace, so their parameters bind normally — and reusing a name across the boundary raises the same `ValueError`:
+
+```python
+User.where(lambda q: q.where_raw("age > :min", {"min": 18})).get()
+User.where_has("posts", lambda q: q.where_raw("views > :v", {"v": 100})).get()
 ```
 
 ### Filtering by relationships: has and where_has
@@ -528,14 +564,37 @@ page2 = await (
 )
 ```
 
-Cursors are opaque URL-safe strings encoding the boundary row's ordering values, so they drop straight into a query parameter. A malformed cursor raises `ValueError`.
+Cursors are opaque URL-safe strings encoding the boundary row's ordering values, so they drop straight into a query parameter. Because they arrive from user-controlled query strings, the decoded payload is fully shape-checked before anything reaches the database: a cursor that is not valid base64 JSON, does not carry a `v` mapping of the query's exact ordering columns, holds a nested object or list in place of a scalar, or carries an unparseable date raises `ValueError("Invalid pagination cursor")`.
 
 A few rules:
 
 - With no `order_by()` on the query, rows are ordered by the primary key ascending automatically.
 - The ordering should uniquely identify rows — include the primary key as a tie-breaker (`.order_by("created_at", "desc").order_by("id", "desc")`), or ties across a page boundary may be skipped.
 - All ordering must come from `order_by()` columns; `order_by_raw()` and `in_random_order()` raise `ValueError`.
+- Nullable ordering columns are fine — NULLs sort last, deterministically. See below.
+- Unions are not supported — see [Unions](#unions).
 - There is no `total` key — computing it would require the full count that keyset pagination exists to avoid. Use `paginate()` when you need page numbers.
+
+#### Nullable ordering columns
+
+Ordering on a nullable column (`published_at`, `created_at`, a nullable score) is supported, and every row is served **exactly once** — no duplicates, no omissions:
+
+```python
+page = Post.order_by("published_at", "desc").order_by("id").cursor_paginate(per_page=20)
+# unpublished posts (published_at IS NULL) arrive on the final pages, once each
+```
+
+The contract:
+
+- **NULLs sort last in both directions**, ascending and descending alike, on every database. Databases disagree about NULL placement by default — one treats NULL as the largest value, the other as the smallest — so the builder pins the placement itself with an explicit rank term rather than inheriting the dialect's default. PostgreSQL and MySQL therefore serve identical row sequences.
+- The keyset predicate matches that placement, so a page boundary landing on a NULL row pages on correctly. Cursors round-trip a NULL boundary value as JSON `null`.
+- A `NOT NULL` ordering column costs nothing extra — no rank term is added, and the ORDER BY stays index-friendly.
+
+The tie-breaker rule still applies: NULLs compare equal to one another, so pair a nullable column with the primary key (`.order_by("published_at").order_by("id")`) if you want a total order.
+
+<Callout type="warn">
+**Cursors are still validated.** A cursor claiming `null` for a `NOT NULL` column cannot come from a real boundary row, so it is rejected as tampering with `ValueError("Invalid pagination cursor")` — the same guard that catches malformed payloads and unparseable dates.
+</Callout>
 
 Cursor pagination works in [row mode](#selecting-specific-columns) too — after `select()`, `page["data"]` holds dicts.
 
@@ -564,6 +623,8 @@ User.where("active", True).chunk(500, index_batch)
 User.where("active", True).chunk_by_id(500, index_batch)          # cursor on "id"
 Event.where("kind", "click").chunk_by_id(1000, handle, column="event_id")
 ```
+
+`chunk_by_id()` / `lazy_by_id()` order by `column` alone when it is `NOT NULL`. If `column` is nullable they follow the same NULL contract as [cursor pagination](#nullable-ordering-columns) — NULLs last, primary key appended as a tie-breaker — so a chunk ending on a NULL still advances and every row is visited exactly once. They also replace any earlier `order_by()` on the query: the walk order has to match the keyset cursor, or rows would be skipped.
 
 The async forms take a coroutine callback:
 
@@ -634,6 +695,27 @@ User.where("name", "A").or_where("name", "B").update({"age": 99})
 ```
 
 Also note: a builder update with **no** where clause updates every row in the table.
+</Callout>
+
+### Updating and deleting through a join
+
+`UPDATE` and `DELETE` have no `FROM`/`JOIN` list of their own, so a join-narrowed mutation is scoped through a primary-key subquery instead:
+
+```python
+(
+    User.join("posts", "id", "=", "posts.user_id")
+    .where("posts.status", "published")
+    .update({"is_author": True})
+)
+# UPDATE users SET is_author = true
+#  WHERE id IN (SELECT pk FROM (SELECT users.id FROM users
+#                               JOIN posts ON ... WHERE ...) AS scope)
+```
+
+The mutation therefore hits exactly the rows the equivalent `get()` returns — the same guarantee as an unjoined update. The extra derived-table wrapper keeps it portable: MySQL otherwise refuses a subquery that reads the table being modified.
+
+<Callout type="info">
+This path needs a single-column primary key. On a model with a composite key, a join-narrowed `update()` / `delete()` raises `NotImplementedError` rather than mutating too many rows — fetch the rows with `get()` and mutate them individually.
 </Callout>
 
 ### Increment and decrement
@@ -735,6 +817,21 @@ for post in posts:
 ```
 
 `with_()` also accepts `{relation: callable}` entries that constrain the eager sub-query, and the `with_count()` / `with_sum()` family loads relation aggregates without N+1. Relationships and eager-loading details — including those forms — live on the [Models](/docs/database/models) page.
+
+<Callout type="warn">
+**Aggregates never overwrite a stored column.** A relation aggregate is loaded onto each instance under a derived name — `with_count("posts")` fills `posts_count`, `with_sum("orders", "total")` fills `orders_sum_total`. If the model already has a real column by that name, building the query raises `ValueError`:
+
+```python
+class User(Model):
+    posts_count = int_col(default=0)    # a stored, denormalized counter
+
+User.with_count("posts").get()
+# ValueError: Relation aggregate 'posts_count' collides with the real column
+#             'User.posts_count'. ...
+```
+
+Silently assigning it would shadow the stored value, mark the instance dirty, and let the next `save()` persist the computed aggregate over your data. Rename the column, or read the aggregate with a separate query.
+</Callout>
 
 ## Debugging queries
 

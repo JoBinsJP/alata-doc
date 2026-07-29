@@ -22,7 +22,7 @@ DISKS = {
     "default": "local",
     "local": {
         "driver": "file",
-        "path": "storage/framework/filesystem",
+        "path": "storage/app",
     },
     "s3": {
         "driver": "s3",
@@ -38,7 +38,7 @@ DISKS = {
 
 You can declare as many disks as you like — several S3 buckets, several local roots — each with any name. The `driver` key selects the implementation: `"file"` or `"s3"`.
 
-At boot, `StorageProvider` reads `filesystem.disks`, builds the `Storage` manager with both drivers registered, and binds it in the [service container](/docs/architecture/container) as `storage`. If the config namespace is missing entirely, boot fails with a clear error telling you to add `config/filesystem.py`.
+At boot, `StorageProvider` reads `filesystem.disks`, builds the `Storage` manager with both driver classes registered, and binds it in the [service container](/docs/architecture/container) as `storage`. If the config namespace is missing entirely, boot fails with a clear error telling you to add `config/filesystem.py`.
 
 ## The Storage facade
 
@@ -51,7 +51,24 @@ disk = Storage.disk()          # the default disk
 s3 = Storage.disk("s3")        # a specific disk
 ```
 
-Requesting a disk that isn't configured raises `ValueError`.
+Requesting a disk that isn't configured raises `ValueError`, as does a disk whose `driver` key has no registered implementation.
+
+### One driver instance per disk
+
+Each disk gets its **own** driver instance, built on first use and cached by disk name — so repeated calls for the same disk hand back the same object, and different disks never share one. A handle is bound to its disk for life:
+
+```python
+private = Storage.disk("private")
+public = Storage.disk("public")   # resolving another disk cannot re-point `private`
+
+await something_slow()            # other tasks may resolve other disks meanwhile
+
+private.put("payroll.csv", data)  # still lands on the private disk
+```
+
+That makes a disk handle safe to hold across `await` points, to stash on an object, or to hand to a worker thread. The manager's cache is built under a lock, so concurrent first-use from several threads still yields exactly one instance per disk.
+
+`Storage` (the manager, not the facade) also accepts driver **classes** through `add_driver("name", DriverClass)` when you register your own driver; a driver instance is still accepted and used as a prototype, cloned per disk. Custom drivers should accept `(application, options)` in their constructor — the older `set_options(options)` setter also still works.
 
 <Callout type="warn">
 All storage operations are **synchronous** — they block while reading, writing, or talking to S3. In an async request handler, run them in a worker thread (for example `await anyio.to_thread.run_sync(lambda: Storage.disk("s3").put(key, data))`), or do file work in [queued jobs](/docs/digging-deeper/queues), where blocking is fine.
@@ -131,14 +148,43 @@ kind = mime_type(disk.get_bytes("uploads/file.bin"))  # e.g. "image/png"
 
 ## The local driver
 
-The `file` driver stores files under the disk's `path`, resolved relative to the process working directory — the project root under the `./alata` and uvicorn conventions. The scaffolded disk points at `storage/framework/filesystem`, so:
+The `file` driver stores files under the disk's `path`, resolved relative to the process working directory — the project root under the `./alata` and uvicorn conventions. The scaffolded disk points at `storage/app`, so:
 
 ```python
 Storage.disk("local").put("avatars/1.png", data)
-# → <project>/storage/framework/filesystem/avatars/1.png
+# → <project>/storage/app/avatars/1.png
 ```
 
-Missing parent directories are created on write. `make_directory(path)` creates a directory explicitly, and `get_path(relative)` returns the absolute filesystem path for a stored file when you need to hand it to another library.
+Missing parent directories are created on write. `make_directory(path)` creates a directory explicitly, and `get_path(key)` returns the absolute filesystem path for a stored file when you need to hand it to another library.
+
+### Keys are confined to the disk root
+
+Every key is resolved against the disk root and verified to land inside it. A key that escapes never touches the filesystem — it raises `StoragePathError` (a `ValueError` subclass) naming the offending key:
+
+```python
+from alata.storage.storage import StoragePathError
+
+disk.get("../../etc/passwd")        # StoragePathError
+disk.get("/etc/passwd")             # StoragePathError
+disk.put("../../../tmp/evil", data) # StoragePathError
+```
+
+The guarantee covers every method — `get`, `get_bytes`, `put`, `put_file`, `append`, `prepend`, `copy`, `move`, `delete`, `exists`, `missing`, `store`, `make_directory`, `get_files` — and holds for:
+
+- `..` segments anywhere in the key, including ones spelled with backslashes;
+- absolute paths, which are accepted **only** when they already point inside the root;
+- symlinks that resolve out of the root — the check compares fully resolved paths, so a link inside the disk cannot be used as a door out of it.
+
+Ordinary nested keys are unaffected, and `..` that stays inside the root is fine:
+
+```python
+disk.put("reports/2026/q1/summary.txt", data)  # fine
+disk.put("reports/2026/../2025/summary.txt", data)  # fine — still inside the root
+```
+
+<Callout type="warn">
+This makes user-supplied keys — an upload filename, a path from a request — safe to pass through, but the confinement is per **disk**, not per user. A key is still free to overwrite any other file on the same disk, so keep tenant or user prefixes in the key yourself.
+</Callout>
 
 ## The S3 driver
 
@@ -153,7 +199,7 @@ The `s3` driver builds its boto3 client lazily, on first use, from the disk's ow
 | `endpoint` | Optional endpoint URL — point it at MinIO, LocalStack, or another S3-compatible store. |
 | `use_path_style` | Use path-style addressing instead of virtual-hosted (required by many S3-compatible stores). |
 
-Because credentials live per disk, two disks can target different buckets, regions, or even different accounts. `boto3` is an optional dependency — the driver raises a clear `ModuleNotFoundError` telling you to install it if it's missing.
+Because credentials live per disk, two disks can target different buckets, regions, or even different accounts. Each disk builds and caches its own session, and the cache is keyed by the connection options it was built from — credentials, region, endpoint and addressing style — so changing any of them discards the cached session rather than reusing one built for a different account. `boto3` is an optional dependency — the driver raises a clear `ModuleNotFoundError` telling you to install it if it's missing.
 
 <Callout type="info">
 S3 "not found" responses (404 / NoSuchKey) are translated to the same conventions as the local driver — `get` and `get_bytes` return `None`, `exists` returns `False`. Any other AWS error propagates as an exception.

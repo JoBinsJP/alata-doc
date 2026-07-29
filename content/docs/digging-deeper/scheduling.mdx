@@ -83,6 +83,26 @@ Use `.description("...")` to give any event a readable name for `schedule:list` 
 
 Every event defaults to `* * * * *` (every minute) until you narrow it. All helpers return the event, so they chain.
 
+### Anchors and modifiers
+
+Frequency helpers come in two kinds, and the difference decides what chaining does:
+
+- **Anchors** set the *whole* expression. Anything you spliced before them is replaced: `cron()`, `weekly_on()`, `monthly_on()`, `twice_monthly()`, `yearly_on()`, and the four zero-argument anchors `weekly()`, `monthly()`, `quarterly()`, `yearly()`.
+- **Modifiers** splice individual cron fields and leave the rest alone: the `every_*` helpers, `hourly*()`, `daily()`, `at()` / `daily_at()`, `twice_daily*()` (minute + hour), the day-of-week helpers (weekday field), and `days_of_month()`, `last_day_of_month()`, `quarterly_on()` (day/month fields).
+
+Modifiers compose in either order. Anchors do not compose — they reset.
+
+The four zero-argument anchors make one exception: a time set earlier with `at()` / `daily_at()` is carried over instead of being reset to midnight.
+
+```python
+schedule.command("report:send").at("03:00").weekly()      # 00 03 * * 0  — time kept
+schedule.command("report:send").weekly()                  # 0 0 * * 0    — midnight default
+schedule.command("report:send").weekly_on(0, "03:00")     # 00 03 * * 0  — same thing, explicit
+schedule.command("report:send").at("03:00").cron("0 4 * * *")  # 0 4 * * * — cron() wins outright
+```
+
+The `*_on(...)` anchors take their time as an argument and always use it. `cron()` discards any remembered time — the raw expression is exactly what runs.
+
 ### Minute-level and above
 
 | Method | Cron |
@@ -119,6 +139,8 @@ schedule.command("backup:run").twice_daily(1, 13).sundays()
 
 Available: `weekdays()`, `weekends()`, `mondays()` through `sundays()`, and `days(1, 3, 5)` for arbitrary sets (0 = Sunday).
 
+Chaining order doesn't matter between modifiers: time-of-day methods set only the minute/hour fields and these set only the weekday field, so `mondays().at("03:00")` and `at("03:00").mondays()` both compile to `00 03 * * 1`. An anchor anywhere in the chain still resets everything before it.
+
 ### Sub-minute frequencies
 
 The scheduler supports repeating an event multiple times within its minute. When any sub-minute event is due, `schedule:run` stays alive until the end of the current minute and re-fires it on the configured interval:
@@ -128,6 +150,8 @@ schedule.call(poll_upstream).every_ten_seconds()
 ```
 
 Available: `every_second()`, `every_two_seconds()`, `every_five_seconds()`, `every_ten_seconds()`, `every_fifteen_seconds()`, `every_twenty_seconds()`, `every_thirty_seconds()`. The interval must divide 60 evenly.
+
+Sub-minute events combine with `on_one_server()`: the server claim is taken **once per minute**, before the first run, and every repeat within that minute belongs to the server that won it. A server that loses the claim skips the whole minute rather than the first run only.
 
 ## Constraints and filters
 
@@ -184,6 +208,18 @@ The lock expires automatically after 24 hours as a safety net for crashed execut
 schedule.command("index:rebuild").every_five_minutes().without_overlapping(expires_after=10)
 ```
 
+#### What identifies an event
+
+The lock key is derived from the event's **stable identity**: its cron expression plus what it actually runs — the command string, or the task name and its arguments, or the callback's qualified name and its arguments. Two consequences:
+
+- Same task, different arguments, same frequency → **different** locks. Per-tenant jobs like `schedule.job("reports:generate", "tenant-a")` and `schedule.job("reports:generate", "tenant-b")` never block each other.
+- `description()` is **not** part of the key. Rewording a description leaves overlap protection exactly where it was; it never silently resets the lock mid-deploy.
+
+Keyword-argument order doesn't matter. Two caveats worth knowing when you rely on the key:
+
+- Arguments are rendered with `repr()`. Pass plain data — an object with the default `<... at 0x...>` repr produces a key that changes every process.
+- Sibling lambdas share a qualified name, so a lambda's identity includes its source line. Schedule a **named function** when the key must survive edits to the schedule file.
+
 ### Running on one server
 
 When the scheduler runs on multiple servers, every server would fire every event. `on_one_server()` makes servers race for an atomic cache lock — the first to acquire it runs the event, the rest skip it:
@@ -193,6 +229,8 @@ schedule.job("reports:generate").daily_at("02:00").on_one_server()
 ```
 
 The lock key is scoped to the current minute (with a TTL just over one cron cycle), so consecutive minutes use distinct keys and a lock claimed late in one minute can never starve the next minute's run.
+
+The claim is taken **once per minute per event**, not once per execution — so a sub-minute event that wins the claim keeps running for the rest of that minute instead of losing to its own lock on the second repeat.
 
 <Callout type="warn">
 Both `without_overlapping()` and `on_one_server()` are backed by the configured cache store — Redis by default. All servers must point at the **same** cache for the locks to mean anything.
@@ -223,6 +261,23 @@ Add a single cron entry on your server that invokes `schedule:run` every minute:
 ```
 
 Each invocation evaluates all registered events, executes the due ones (one-shot events run concurrently), and exits — unless sub-minute events are due, in which case it stays alive for the remainder of the minute.
+
+### When one event is broken
+
+A single bad definition never takes the schedule down with it:
+
+- An event whose expression can't be evaluated is logged and skipped; every other due event still runs.
+- If the `schedule()` method itself raises — a constraint applied to an expression that can't hold it, say — the failure is logged loudly and the events registered *before* it still run. Events defined after the failing line were never registered, and the log says so.
+
+Both commands report this, so `schedule:list` is the fastest way to see what's actually registered. Broken expressions show up there as `INVALID EXPRESSION` in the next-due column.
+
+Cron nicknames (`@daily`, `@hourly`, `@weekly`, `@monthly`, `@yearly`) are valid input to `cron()` and expand to their five-field form when you splice a constraint onto them:
+
+```python
+schedule.command("report:send").cron("@daily").mondays()   # 0 0 * * 1
+```
+
+`@reboot` has no periodic equivalent — applying a constraint to it raises `InvalidScheduleExpressionError` naming the event, rather than failing deep inside the DSL.
 
 ### Inspecting the schedule
 

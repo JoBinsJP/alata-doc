@@ -166,8 +166,10 @@ async def lifespan(_fastapi_app):
 fastapi = FastAPI(title=title, version=version, lifespan=lifespan)
 ```
 
-- **`async_boot_providers()`** runs on server startup, calling `async_boot()` on every provider that overrides it, in registration order. It is idempotent per boot cycle — a second startup within the same process is a no-op.
+- **`async_boot_providers()`** runs on server startup, calling `async_boot()` on every provider that overrides it, in registration order. It is idempotent *within* a lifespan — a repeated startup without an intervening shutdown is a no-op.
 - **`shutdown_providers()`** runs on server teardown, calling `shutdown()` on providers in **reverse** registration order. Services shut down after everything that depends on them: your app providers clean up first, then the queue and cache release their clients, and the database pools dispose last.
+
+Startup and teardown are symmetric: shutdown clears the async-boot flag, so a second lifespan in the same process boots again rather than reusing resources the first teardown already released. This matters for tests that open two `TestClient` blocks and for deployment patterns that restart the ASGI app in-process — a provider that acquires in `async_boot()` and releases in `shutdown()` gets a fresh resource each time.
 
 The `FastapiProvider` also names the app from your settings (`APP_NAME`, `APP_VERSION`) and registers the maintenance-mode console commands (`up` / `down`).
 

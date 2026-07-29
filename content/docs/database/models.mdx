@@ -248,10 +248,10 @@ User.where("active", False).delete()   # bulk delete via the query builder
 ```python
 user = User.find(1)
 
-user.is_dirty()             # any attribute changed since load?
+user.is_dirty()             # any attribute changed since the last load or write?
 user.is_dirty("name")       # specific attribute(s) changed?
 user.is_clean()
-user.get_original("name")   # value as loaded from the database
+user.get_original("name")   # value as last read from / written to the database
 
 fresh = user.fresh()        # re-fetch this row (returns a new instance)
 copy  = user.replicate()    # clone without the primary key — save() inserts a new row
@@ -259,9 +259,27 @@ copy  = user.replicate()    # clone without the primary key — save() inserts a
 
 Async: `afresh()`.
 
+The dirty baseline is re-snapshotted whenever the instance is persisted, so `create()` and `save()` both leave it consistent with what is actually stored:
+
+```python
+user = User.create({"name": "Ada", "email": "ada@example.com"})
+user.is_dirty()             # False — freshly persisted
+user.get_original("name")   # "Ada"
+
+user.name = "Ada L."
+user.is_dirty("name")       # True
+user.get_original("name")   # "Ada"
+
+user.save()
+user.is_dirty()             # False again
+user.get_original("name")   # "Ada L." — the persisted value
+```
+
+This is what makes audit trails, change logs, and "did this field actually change?" guards correct when they run after a write.
+
 ## Attribute Casting
 
-`__casts__` converts between database values and Python types transparently — on read, and on write through `create`/`insert`:
+`__casts__` converts between database values and Python types transparently — on read, and on every write path (`create`, `insert`, `save`):
 
 ```python
 class Event(Model):
@@ -283,6 +301,33 @@ The `"decimal"` cast returns `decimal.Decimal` values on read and writes exact d
 
 <Callout type="info">
 JSON casts are column-aware: on a native `JSON` column the dict/list is passed through untouched (what async drivers expect), while on a `TEXT` column it is serialized to a JSON string. You get the right behavior either way.
+</Callout>
+
+### Mutating cast values in place
+
+Reading a cast attribute hands back the **same** decoded object every time, so containers can be edited in place — the edit is visible on the next read, is picked up by dirty checking, and is written by `save()`:
+
+```python
+event = Event.find(1)
+
+event.payload["kind"] = "login"   # in-place edit of the decoded dict
+event.payload                     # {"kind": "login"} — same object, not a fresh decode
+event.is_dirty("payload")         # True
+event.save()                      # persisted
+
+Event.find(1).payload             # {"kind": "login"}
+```
+
+Assigning a whole new value works the same way, on both the sync and async paths:
+
+```python
+event.payload = {"kind": "signup", "source": "web"}
+event.save()          # write-cast applied here, not only in create()
+await event.asave()
+```
+
+<Callout type="info">
+The dirty baseline stores cast containers **by value**, not by reference, which is what lets an in-place edit register as a change. Writing a new value to the column replaces the decoded object, so a reference you captured before the assignment goes stale — read the attribute again after assigning or saving.
 </Callout>
 
 ## Serialization
@@ -405,6 +450,10 @@ if include_comments:
 
 `load()` re-queries a relation even when it is already loaded (a refresh); `load_missing()` leaves models that already have the relation untouched and queries only the ones missing it. Both return the collection, and their async twins are `aload` / `aload_missing`. See the [Collections](/docs/digging-deeper/collections#relationship-loading-model-collections) reference.
 
+<Callout type="info">
+A collection holding **more than one model class** is grouped by class and loaded per class — one query per relation per class. Every item resolves the relation through its own class, so a name that means different things on different models loads correctly, and a class that doesn't define the relation raises `ValueError` naming that class.
+</Callout>
+
 ### Counting related rows: with_count
 
 `with_count()` loads a `{relation}_count` integer attribute onto each result — one grouped subquery per relation regardless of result size, no N+1, for every relationship type including many-to-many:
@@ -450,7 +499,9 @@ for thread in threads:
 
 Eager loading resolves every parent's row in a **single query** using a `row_number()` window partitioned by the foreign key — portable across PostgreSQL, MySQL 8.0+ (MariaDB 10.2+), and SQLite 3.25+. Lazy access (`thread.latest_message`) runs a plain `ORDER BY ... LIMIT 1` query instead.
 
-Both variants take the ordering column (default `"created_at"`); ties are broken by the primary key. `oldest_of_many()` is the mirror — the minimum instead of the maximum:
+Both variants take the ordering column (default `"created_at"`); ties are broken by the primary key. A row whose ordering column is `NULL` never wins the reduction — it sorts last in both directions, identically on every dialect, so a missing timestamp can't masquerade as the newest row. (A parent whose related rows are *all* NULL still resolves to one row, chosen by the primary-key tie-break.)
+
+`oldest_of_many()` is the mirror — the minimum instead of the maximum:
 
 ```python
 "first_message": HasMany("Message", "thread_id").oldest_of_many(),
@@ -499,7 +550,9 @@ await user.relation("roles").async_([1, 2, 3])
 
 A few things to know:
 
-- `attach()` performs no existence check — attaching an already-attached id inserts a duplicate pivot row. Reach for `sync()` or `toggle()` when idempotency matters.
+- **`attach()` never de-duplicates.** It is a plain INSERT with no existence check, so attaching an already-attached id inserts a second pivot row (and passing the same id twice in one call inserts it twice). Reach for `sync()` — which attaches only what is missing — when idempotency matters, and add a unique constraint on the two pivot key columns if duplicates must be impossible.
+- Duplicate pivot rows collapse on **read**: lazy and eager loads both return one related model per distinct id, carrying the first pivot row's data. The extra rows still exist in the table, though, and `with_count()` counts them.
+- `sync()` and `toggle()` run their read and every resulting insert/delete/update inside a **single transaction**, so a failure part-way through leaves the pivot table exactly as it was. The transaction does not lock out a concurrent `sync()` on the same parent — that is what the unique constraint is for.
 - Pivot operations require a saved parent; on an instance without a primary-key value they raise `ValueError`.
 - `relation()` works on every relationship type as a fresh, uncached query path — `user.relation("posts").get()` always hits the database, in contrast to the cached attribute access `user.posts`.
 
@@ -518,6 +571,10 @@ user.roles[0].pivot   # {"user_id": 1, "role_id": 3, "level": 2}
 ```
 
 The `pivot` dict is populated on both lazy and eager loads. `with_pivot()` returns a modified copy of the relationship, so it composes at declaration time without mutating a shared definition.
+
+<Callout type="warn">
+The related model must not map an attribute of its own named `pivot`. Loading a `with_pivot()` relationship whose target already has a `pivot` column raises `ValueError` instead of writing the pivot dict over real data — rename the column, or drop `with_pivot()` from that relationship.
+</Callout>
 
 ### Querying by relationship existence
 
@@ -626,6 +683,40 @@ def protect_admins(self):
 ```
 
 Hooks are collected across the whole class hierarchy, so mixins can contribute hooks too.
+
+### Async hooks
+
+A hook may be an `async def`. Async hooks are awaited by the **async** persistence methods — `acreate`, `asave`, `adelete` and their `_quietly` variants — in registration order, so an async *before* hook can cancel the write by returning `False` exactly like a synchronous one:
+
+```python
+class Document(Model):
+    __tablename__ = "documents"
+
+    @hook("saving")
+    async def validate_remotely(self):
+        if not await policy.allows(self):
+            return False        # cancels the write
+
+    @hook("saved")
+    async def reindex(self):
+        await search.index(self)
+
+await Document.acreate({...})   # both hooks run
+```
+
+Reaching an async hook from a **synchronous** write raises `AsyncHookError`, naming the hook and the async method to use instead — the coroutine is never quietly discarded:
+
+```python
+from alata.db.events import AsyncHookError
+
+Document.create({...})
+# AsyncHookError: Hook 'reindex' on Document is an async function, but the 'saved'
+# event fired from a synchronous persistence call. … call acreate() or asave() instead …
+```
+
+So: if a model has async hooks, write to it through the async twins. A model can freely mix sync and async hooks — the synchronous path only fails when it actually reaches an async one.
+
+`@hook` also rejects misuse at decoration time: decorating a non-callable, or an async **generator** function (`async def` with `yield`), raises `TypeError` immediately rather than registering a hook that could never run.
 
 <Callout type="info">
 Bulk operations that skip instantiating models — `insert()`, `upsert()`, and query-builder `update()`/`delete()` — fire **no model events**: no hooks run and nothing is dispatched to the event bus. Hooks fire for `create()`, `save()`, and instance `delete()` (and their async variants).

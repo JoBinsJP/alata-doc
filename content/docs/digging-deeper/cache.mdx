@@ -4,7 +4,7 @@ description: A Redis-backed cache facade with TTLs, atomic locks, cache-aside he
 icon: Gauge
 ---
 
-Alata ships a cache layer with a pluggable store behind a single facade. The default store is Redis, wired up by the framework's providers at boot — your application code just imports `Cache` and calls it, in async or sync contexts alike.
+Alata ships a cache layer with a pluggable store behind a single facade — file, Redis, database, memory, or null, wired up by the framework's providers at boot. Your application code just imports `Cache` and calls it, in async or sync contexts alike. A fresh scaffold defaults to the zero-dependency file store; switch to Redis (or the database store) for multi-worker deployments.
 
 ```python
 from alata.cache import Cache
@@ -22,24 +22,71 @@ Cache configuration lives in `config/cache.py`:
 from config.settings import settings
 
 CACHE_CONFIG = {
-    # Default store driver. Override via CACHE_STORE env var.
-    "default": getattr(settings, "CACHE_STORE", "redis"),
-    # Global key prefix — prevents collisions when multiple apps share Redis.
+    # Default store. Override via CACHE_STORE env var.
+    "default": settings.CACHE_STORE,
+    # Global key prefix — prevents collisions when multiple apps share a backend.
     "prefix": getattr(settings, "CACHE_PREFIX", "alata_cache:"),
+    # Named stores available through Cache.store(name).
+    "stores": {
+        "redis": {"driver": "redis", "connection": "cache"},
+        # "database": {"driver": "database", "table": "alata_cache", "connection": "default"},
+        "file": {"driver": "file", "path": None},
+        "memory": {"driver": "memory"},
+        "null": {"driver": "null"},
+    },
 }
 ```
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `default` | `redis` | The store driver: `redis` or `null` (no-op). |
-| `prefix` | `alata_cache:` | Prepended to every key. Lets multiple apps share one Redis safely. |
+| `default` | `file` | Name of the store to use by default (`CACHE_STORE` env). |
+| `prefix` | `alata_cache:` | Prepended to every key. Lets multiple apps share one backend safely. |
+| `stores` | — | Named store definitions; each picks a `driver` (`redis`, `database`, `file`, `memory`, `null`) plus driver options. |
 | `strict_locking` | `True` | Whether lock acquisition fails when Redis is down (see [Locks](#atomic-locks)). |
 | `async_client_binding` | — | Optional container binding name whose async Redis client the cache should reuse. |
 
-At boot, `CacheProvider` builds the configured store and binds it in the [service container](/docs/architecture/container) as `cache`. The Redis store wraps two clients resolved from the container: the sync client `redis.cache` and the async client `redis.cache.async` — both registered by the Redis provider from your `config/redis.py` (see [Named Redis connections](#named-redis-connections)). It also tries to resolve a dedicated `redis.lock` connection so lock traffic never competes with cache traffic; if you haven't configured one, locks share the cache connection.
+### The database driver
+
+The `database` driver keeps the cache in a relational table — shared across
+every worker and server that talks to the same database, with no Redis
+required. Options: `table` (default `"alata_cache"`) names the entry table,
+`connection` a named database connection, `prefix` overrides the global key
+prefix. Locks live in a companion `{table}_locks` table so flushing the
+cache can never release a held lock.
+
+The scaffold ships a `create_cache_table` migration that creates both
+tables (`alata_cache`: key, value, expiration; `alata_cache_locks`: key, owner,
+expiration) — `alata migrate` picks it up like any other migration. If you
+configure a custom `table` name, rename the tables in that migration to
+match. On MySQL the migration also pins the `key` column to the
+`utf8mb4_bin` collation, so keys compare byte-for-byte the way they do on
+PostgreSQL; MySQL's default collation is case- *and* accent-insensitive,
+which would let `User:ABC`, `user:abc` and `user:abç` share a single row.
+
+Writes upsert with the database's native conflict clause, and `increment`
+is a single atomic upsert statement, so counters — including the
+[rate limiter's](/docs/digging-deeper/rate-limiting) fixed windows — are
+correct under concurrency across processes. Expired rows are treated as
+misses and deleted on read.
+
+<Callout type="warn">
+Keys are limited to **255 characters**, including the global prefix — the
+width of the `key` column. A longer key raises `ValueError` naming the limit
+rather than being silently dropped. Hash the user-supplied part of long keys,
+or widen the column in your migration and raise
+`DatabaseCacheStore.KEY_MAX_LENGTH` to match.
+</Callout>
+
+At boot, `CacheProvider` builds the configured store and binds it in the [service container](/docs/architecture/container) as `cache`. The Redis store is handed *resolvers* for two container bindings: the sync client `redis.cache` and the async client `redis.cache.async` — both registered by the Redis provider from your `config/redis.py` (see [Named Redis connections](#named-redis-connections)). It also resolves a dedicated `redis.lock` connection so lock traffic never competes with cache traffic; if you haven't configured one, locks share the cache connection.
 
 <Callout type="info">
-The cache degrades gracefully. If Redis is unreachable — at boot or mid-flight — reads return `None`, writes are silent no-ops, and the failure is logged at debug level. If *no* Redis client can be built at boot, the provider falls back to a no-op store entirely. Your app keeps serving; it's just slower.
+The cache degrades gracefully. If Redis is unreachable — at boot or mid-flight — reads return `None` and writes are silent no-ops. The degradation is deliberate but never silent: the first failure is logged at **WARNING** (once per store), the rest at debug. Clients are re-resolved on every operation, so the cache starts working again on its own once Redis recovers — no restart, and no process stuck with rate limiting permanently off. The provider falls back to a no-op store only when *no* Redis connection is registered at all, which is a configuration fact rather than an outage.
+</Callout>
+
+<Callout type="warn">
+While degraded, counters do not accumulate — so anything counting attempts
+(the [rate limiter](/docs/digging-deeper/rate-limiting) most of all) sees zero
+and lets every request through. Treat the WARNING as an alerting signal.
 </Callout>
 
 ## The Cache API
@@ -82,6 +129,35 @@ async def fetch_dashboard(user_id: str) -> dict:
 
 By default `remember` serializes with `json.dumps` and deserializes with `json.loads`, so dicts and lists round-trip transparently: you get the structured object back on both cache hits and misses. Pass your own `serializer`/`deserializer` pair for other types. A callback returning `None` is not cached.
 
+### Counters
+
+`increment` adds to a counter key atomically and returns the new count. A
+missing (or expired) key is created at `amount` and stamped with `ttl`
+seconds; an existing key keeps its original expiry, so increments never
+extend the window — which is what makes fixed-window counting correct.
+
+```python
+attempts = await store.increment("login:u1", 1, ttl=60)
+```
+
+Every driver agrees on the two edge cases:
+
+| Case | Behavior |
+| --- | --- |
+| `ttl` of zero or less | The counter is created with **no expiry**. (`put` treats a non-positive `ttl` differently — it skips the write entirely — because a counter that expires the moment it is created can never accumulate, silently disabling rate limiting.) |
+| The existing value is not an integer | The stored value is **left untouched** and `0` is returned. It is never destroyed and never replaced by a counter. |
+
+<Callout type="info">
+The `redis` and `database` drivers increment with a single atomic
+statement. The `file` driver cannot, so it serializes its read-modify-write
+behind a short-lived guard file scoped to the key. Only the writer that took
+a guard releases it, and a guard is taken over only once its expiry has
+genuinely passed — a crashed holder. A writer that waits out
+`FileCacheStore._GUARD_TIMEOUT_SECONDS` (5s) raises `CacheGuardTimeoutError`
+rather than stealing a live guard and dropping counts. For counters under
+heavy multi-process contention, prefer `redis` or `database`.
+</Callout>
+
 ### Bulk removal
 
 ```python
@@ -92,7 +168,12 @@ deleted = await Cache.forget_by_prefix("dashboard:user123:")
 await Cache.flush()
 ```
 
-When a global key prefix is configured, `flush` scans and deletes only your app's prefixed keys — it will not wipe another application's data on a shared Redis.
+Prefixes are matched **literally**. Characters that would be wildcards in the
+backend's own pattern language — `*`, `?`, `[`, `]`, `\` for Redis, `%` and
+`_` for SQL — are escaped, so `forget_by_prefix("q[abc]:")` deletes exactly
+the keys starting with `q[abc]:` and nothing else.
+
+When a global key prefix is configured, `flush` deletes only your app's prefixed keys — it will not wipe another application's data on a shared Redis, and two file stores pointed at one directory with different prefixes never clear each other. `flush` never touches locks either: clearing the cache cannot release a lock somebody is holding.
 
 ### Atomic locks
 
@@ -172,7 +253,7 @@ CONNECTIONS = {
 
 For each entry, `RedisProvider` registers two lazy container singletons:
 
-- `redis.<name>` — a sync client (`decode_responses=True`), pinged at first resolution; resolves to `None` if Redis is unreachable.
+- `redis.<name>` — a sync client (`decode_responses=True`), pinged at first resolution; resolves to `None` if Redis is unreachable. The ping is bounded (3s connect, 5s operation), so a host that drops packets rather than refusing them fails fast instead of stalling startup.
 - `redis.<name>.async` — an async client that connects lazily on first command.
 
 ```python

@@ -83,13 +83,21 @@ Runs every pending migration, in filename order, as a new **batch**. The other c
 | `./alata migrate` | Run all pending migrations |
 | `./alata migrate:rollback` | Revert the last batch (calls each migration's `down()` in reverse order) |
 | `./alata migrate:status` | Show every migration with its ran/pending state and batch number |
-| `./alata migrate:fresh` | Drop everything (runs every `down()` in reverse, drops the tracking table) and re-run all migrations from scratch |
+| `./alata migrate:fresh` | Drop everything (runs every `down()` in reverse, then drops the tracking table) and re-run all migrations from scratch |
 | `./alata migrate:sync` | Mark all discovered migrations as run **without executing any SQL** |
 | `./alata make:migration <name>` | Generate a new migration file |
 
 <Callout type="warn">
 `migrate:fresh` destroys all migrated tables and their data. It is for development and test databases only.
 </Callout>
+
+#### What `migrate:fresh` guarantees
+
+The whole operation — teardown and re-run — happens under the migration lock, so a concurrent deploy cannot migrate into a database that is being torn down.
+
+The order is deliberate: every `down()` runs first, in reverse, and the **tracking table is dropped last**. A `down()` that fails aborts the command with the failing migrations named, and leaves the tracking table intact — the database still matches its own migration history, so `migrate:rollback` still works and nothing is orphaned. Drop failures are never swallowed: re-running migrations over surviving tables would quietly produce a schema that doesn't match its migrations.
+
+If a `down()` fails, fix it (or drop the objects by hand) and run `migrate:fresh` again.
 
 <Callout type="info">
 `migrate:sync` is the adoption path: if your tables already exist (created by hand or by a previous tool), run it once so the tracking table matches reality and `migrate` reports nothing to do.
@@ -256,14 +264,27 @@ Operations run in a safe order automatically: index/constraint drops first, then
 
 ### Concurrent indexes
 
-Building an index on a large PostgreSQL table takes a write lock. `index_concurrently()` builds it without blocking writes (it runs outside the migration's transaction, in autocommit mode):
+Building an index on a large PostgreSQL table takes a write lock that blocks every writer for the duration. `index_concurrently()` builds it without that lock:
 
 ```python
 with self.schema.table("events") as table:
     table.index_concurrently("occurred_at")
 ```
 
-On dialects without concurrent index support it falls back to a regular index.
+It works in `create()` blocks too — the index is built once the table exists.
+
+**How it runs.** `CREATE INDEX CONCURRENTLY` cannot run inside a transaction, and the lock it needs is one that the migration's own transaction already holds. So the migrator **defers** it: the migration's DDL and its tracking row commit first, and the index is built immediately afterwards on a separate autocommit connection. Two consequences worth knowing:
+
+- The index appears a moment *after* the migration reports success, not atomically with it.
+- If the build fails, the schema change stays committed — only the index is missing, and PostgreSQL may leave an unusable index behind. The migrator says so, names the index, and exits non-zero. Drop the leftover (`DROP INDEX IF EXISTS <name>`) and rebuild it, or add a follow-up migration.
+
+The build waits at most 30 seconds to acquire its lock. Blocked behind a long-running transaction, it fails with a database error rather than waiting forever.
+
+<Callout type="warn">
+Calling `index_concurrently()` on a `Schema` bound to a connection with an open transaction — outside the migrator — raises `ConcurrentIndexInTransactionError` rather than deadlocking against itself. Declare concurrent indexes in a migration, or run them through an engine with no transaction open.
+</Callout>
+
+On dialects without concurrent index support (MySQL, SQLite) it compiles to a regular index and runs inline, so the index exists when the migration finishes.
 
 ## Other Schema Operations
 

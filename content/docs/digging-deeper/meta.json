@@ -1,5 +1,16 @@
 {
   "title": "Digging Deeper",
   "icon": "Wrench",
-  "pages": ["console", "scheduling", "queues", "cache", "events", "storage", "collections", "context", "health"]
+  "pages": [
+    "console",
+    "scheduling",
+    "queues",
+    "rate-limiting",
+    "cache",
+    "events",
+    "storage",
+    "collections",
+    "context",
+    "health"
+  ]
 }

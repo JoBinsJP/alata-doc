@@ -106,10 +106,13 @@ Route definitions, separated from controller logic. `routes/api.py` builds an `A
 
 ## `storage/`
 
-Runtime files written by the framework:
+Everything the application persists locally:
 
-- **`storage/framework/`** — the local filesystem disk (`storage/framework/filesystem`) and the maintenance-mode flag file (`storage/framework/down`, managed by `./alata down` / `./alata up`).
+- **`storage/app/`** — your files: the default local [filesystem disk](/docs/digging-deeper/storage) writes here.
+- **`storage/framework/`** — framework-owned artifacts: the file cache store (`storage/framework/cache`) and the maintenance-mode flag (`storage/framework/down`, managed by `./alata down` / `./alata up`).
 - **`storage/logs/`** — the `file` log channel writes daily-rotated files here (`app-2026-07-28.log`).
+
+Runtime contents are gitignored; the directory skeleton ships via `.gitkeep` files.
 
 ## `tests/`
 
