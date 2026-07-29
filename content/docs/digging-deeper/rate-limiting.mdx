@@ -4,55 +4,9 @@ description: Throttle HTTP routes and domain actions with a cache-backed fixed-w
 icon: Gauge
 ---
 
-Alata ships a fixed-window rate limiter for two jobs: throttling HTTP routes (429s with proper headers) and limiting any domain action ("three OTP sends per five minutes"). Counters live on a [cache store](/docs/digging-deeper/cache) — any configured store works — and windows are fixed: the first hit of a window sets its expiry in the same store operation, so on an atomic backend like Redis concurrent requests can never create a bucket that never expires.
+Alata ships a fixed-window rate limiter for two jobs: throttling HTTP routes (429s with proper headers) and limiting any domain action ("three OTP sends per five minutes"). Counters live on a [cache store](/docs/digging-deeper/cache), so there is no separate backend to run.
 
-## The algorithm: a fixed window
-
-Alata counts attempts in a **fixed window**. The first attempt for a key opens a window, the counter increments on every attempt, and the whole counter disappears when the window expires. It is the same algorithm the mainstream web frameworks ship, and it is the right default: one counter per key, one round trip per decision, no per-request bookkeeping to store or prune.
-
-Its trade-off is worth knowing before you pick a number. A window is anchored to a key's first attempt, not to a wall clock, and it resets all at once — so traffic can cluster on either side of a reset:
-
-```text
-60/minute, window opened at t=0
-  t=59.5s   59 attempts   → allowed (fills the window)
-  t=60.0s   window expires
-  t=60.5s   60 attempts   → allowed (a fresh window)
-  ──────────────────────────────────────────────────
-  119 attempts inside a ~1 second span
-```
-
-Nothing is broken here — each window honored its own limit. But "60 per minute" bounds *a window*, not *any 60-second span*, and the worst case is close to twice the nominal rate. Size limits with that in mind: if a burst of 2× would hurt, set the limit at half what the endpoint can survive, or use a shorter window (`Limit.per_minutes(1, 60)` and `Limit.per_second(1)` bound the same average rate very differently).
-
-<Callout type="info">
-**When a fixed window is not enough.** A smoother shape — a sliding window, or a token bucket that refills continuously and allows a controlled burst — costs more state and more work per request. That belongs at the edge, in the API gateway or CDN that already sees every request, not in the application process. Use this limiter to protect *your* endpoints and domain actions; use the edge for traffic shaping.
-</Callout>
-
-## How admission is decided
-
-Every admission decision comes from the counter's own increment, in one operation:
-
-```text
-count = increment(bucket, 1, ttl=window)   # atomic, returns the post-hit count
-allowed = count <= max_attempts
-```
-
-The limiter never reads the counter and then writes it. That pair is two round trips to the store, and in the gap between them every concurrent request sees the same empty bucket — a limit of 1 would admit as many requests as arrive at once, which is exactly the burst a limiter exists to stop. Deciding from the value the store hands back makes the check and the consume the same operation.
-
-Two consequences follow from that, and both are deliberate:
-
-<Callout type="info">
-**A rejected attempt still increments the counter.** This is the price of deciding atomically. A caller that keeps hammering a closed bucket keeps pushing the count up, so the count can exceed `max_attempts` — `remaining` clamps at 0, so `X-RateLimit-Remaining` never goes negative. The window is unaffected: it still expires on its original schedule, because the store never extends a TTL on a later increment.
-</Callout>
-
-An allowed request costs exactly one store round trip. A rejected one costs a second, to read how long is left in the window for `Retry-After`.
-
-### Retry-After is never zero
-
-A blocked response always carries `Retry-After: 1` or more (and `X-RateLimit-Reset` matches it). The remaining window is whole seconds, so a bucket with 300 ms left would otherwise round to `0` — and a client honoring `Retry-After: 0` retries immediately, hot-looping against a limit it cannot pass. Waiting one second too long is harmless; waiting zero is not.
-
-## Throttling routes
-
-Attach the `throttle()` dependency to a route or router with a rate string:
+Attach `throttle()` to a route and you are done:
 
 ```python title="routes/api.py"
 from fastapi import APIRouter, Depends
@@ -66,17 +20,70 @@ async def search():
     ...
 ```
 
-Accepted units: `second`, `minute`, `hour`, `day` (singular or plural — `"10/second"`, `"1000/day"`). The rate string is parsed when the route is declared, so a typo or an impossible rate fails at startup rather than on the first request.
+Each caller now gets 60 requests per minute on `/search`. The 61st gets a `429` with a `Retry-After` header.
 
-The attempt count must be positive: `"0/minute"` is rejected. A zero reads like "close this route", but it could equally be read as "don't count anything here" — and getting it backwards leaves an endpoint an operator meant to shut off completely wide open. Say which one you mean explicitly: `Limit.none()` exempts a route, `Limit(0, 60)` closes it.
+## Throttling routes
 
-Buckets are per-route and per-caller: the request-context user id when [IdentityMiddleware](/docs/basics/middleware) has resolved one, otherwise the client IP.
+### Rate strings
 
-Within the limit, responses carry `X-RateLimit-Limit` and `X-RateLimit-Remaining`. Over it, the framework raises `ThrottledError` — rendered by the [exception handler](/docs/basics/error-handling) as a `429` with `Retry-After` and `X-RateLimit-Reset` headers:
+A rate string is `<attempts>/<unit>`. The accepted units are `second`, `minute`, `hour` and `day`, singular or plural, and surrounding whitespace is ignored:
+
+```python
+throttle("10/second")
+throttle("60/minute")
+throttle("100/hours")
+throttle(" 5 / day ")
+```
+
+The string is parsed while the route is being *declared*, so a typo or an impossible rate fails at startup rather than on the first request.
+
+The attempt count must be positive: `"0/minute"` is rejected outright. A zero reads like "close this route", but it could equally be read as "don't count anything here" — and getting it backwards leaves an endpoint an operator meant to shut off completely wide open. Say which one you mean explicitly: `Limit.none()` exempts a route, `Limit(0, 60)` closes it.
+
+### Route or router
+
+`throttle()` returns a plain dependency, so it goes wherever dependencies go. Per route:
+
+```python
+@router.get("/search", dependencies=[Depends(throttle("60/minute"))])
+async def search():
+    ...
+```
+
+Or across a whole router, applying to every route it carries:
+
+```python title="routes/api.py"
+router = APIRouter(prefix="/api", dependencies=[Depends(throttle("1000/hour"))])
+```
+
+Buckets are still per route even when the dependency is declared once on the router — `/api/search` and `/api/orders` each count separately against their own 1000/hour.
+
+### What the caller sees
+
+Within the limit, the response carries the current state of the bucket:
+
+```http
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 59
+```
+
+Over it, the framework raises `ThrottledError`, which the [exception handler](/docs/basics/error-handling) renders as a `429`:
 
 ```json
 { "error": "Too Many Requests", "message": "Too many requests." }
 ```
+
+```http
+Retry-After: 48
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 48
+```
+
+`Retry-After` and `X-RateLimit-Reset` always agree, and both are seconds until the window reopens.
+
+<Callout type="info">
+The response is fixed — there is no per-limit response callback. To change the body or add headers globally, handle `ThrottledError` in your application's [exception handler](/docs/basics/error-handling).
+</Callout>
 
 ### Route identity and mounted sub-apps
 
@@ -89,13 +96,307 @@ root.mount("/v2", v2_app)   # /v2/thing  → its own bucket
 
 Both sub-apps declare `/thing`, but they are throttled independently: traffic to `/v1/thing` can never 429 `/v2/thing`.
 
-### Custom keys
+## Segmenting limits
 
-Pass a callable to key the bucket by anything on the request:
+"60 per minute" is meaningless until you say *per what*. A bucket id is built from three parts:
+
+```text
+route id  +  limit slot  +  caller
+```
+
+The route id and the slot (which position the limit occupies, when a route carries several) are chosen for you. The **caller** is the part you control, and there are two ways to set it.
+
+`key=` replaces the caller for the whole dependency — a callable receiving the request and returning a string:
 
 ```python
 throttle("100/minute", key=lambda request: request.headers.get("X-Tenant", "public"))
 ```
+
+`.by()` scopes a single `Limit` object:
+
+```python
+Limit.per_minute(60).by(tenant_id)
+```
+
+<Callout type="warn">
+The two do not stack. When a `Limit` carries a `.by()` discriminator, that discriminator **replaces** the caller for that limit — the `key=` callable (and the default keying) is not consulted for it. Use `key=` to change how *every* limit on the route identifies a caller, and `.by()` when one specific limit needs a different scope from the rest, such as a shared global cap.
+</Callout>
+
+### The Limit object
+
+```python
+from alata.rate_limiting import Limit
+
+Limit.per_second(10)
+Limit.per_minute(60)
+Limit.per_minutes(5, 10)    # 10 attempts per 5 minutes
+Limit.per_hour(1000)
+Limit.per_day(10000)
+Limit.per_minute(60).by(user_id)   # scope the bucket to a caller
+Limit.none()                        # exempt — the unlimited sentinel
+Limit(0, 60)                        # closed — every request rejected
+```
+
+`by()` returns a new `Limit` — they're frozen values, safe to share and to build once at import time.
+
+`Limit.none()` is the *only* way to build an unlimited limit. A count of zero is not a synonym for it: `Limit(0, 60)` rejects everything, matching `limiter.attempt(key, max_attempts=0, ...)`, which has always returned `False`. Exempting a route and closing it are opposite intents, so they get opposite spellings. An exempt limit is skipped entirely — it sets no `X-RateLimit-*` headers and touches no counter.
+
+### Per authenticated user
+
+This is the default. With no `key=`, the caller is the user id from the [request context](/docs/digging-deeper/context) when one is set, and the client IP otherwise:
+
+```python
+@router.get("/reports", dependencies=[Depends(throttle("30/minute"))])
+async def reports():
+    ...
+```
+
+For that to key on the user rather than the address, something must populate `user_id_context` early in the request. That is your [middleware](/docs/basics/middleware)'s job:
+
+```python title="app/http/middleware.py"
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from alata.context import user_id_context
+
+
+class IdentityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        token = user_id_context.set(resolve_user_id(request))  # your auth logic
+        try:
+            return await call_next(request)
+        finally:
+            user_id_context.reset(token)
+```
+
+With that in place an authenticated caller gets a `user:<id>` bucket that follows them across addresses, and anonymous traffic falls back to `ip:<address>`.
+
+### Per IP, for anonymous traffic
+
+Login, registration and password-reset endpoints have no user yet, so the address is the only handle you have. Key on it explicitly rather than relying on the fallback — an explicit key is honest about what it protects, and it lets you read the address your proxy forwards (see [behind a reverse proxy](#behind-a-reverse-proxy)):
+
+```python title="app/http/throttling.py"
+from fastapi import Request
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return f"ip:{forwarded.split(',')[0].strip()}"
+    return f"ip:{request.client.host}" if request.client else "ip:unknown"
+```
+
+```python
+@router.post("/login", dependencies=[Depends(throttle("5/minute", key=client_ip))])
+async def login():
+    ...
+```
+
+### Per tenant or API key
+
+Machine-to-machine traffic identifies itself with a header. Key on it directly:
+
+```python
+def api_key(request: Request) -> str:
+    return f"key:{request.headers.get('X-Api-Key', 'anonymous')}"
+
+
+@router.get("/v1/events", dependencies=[Depends(throttle("1000/hour", key=api_key))])
+async def events():
+    ...
+```
+
+Give the fallback bucket a name you can spot in your own metrics — every caller that arrives without the header shares it, which is the behavior you want for unauthenticated traffic and the behavior you want to notice.
+
+### Per plan tier
+
+When the number itself depends on who is asking, a rate string cannot express it. Register a [named limiter](#named-limiters) whose resolver returns a different `Limit` per request:
+
+```python title="app/providers/app_provider.py"
+from alata.rate_limiting import Limit
+from alata.support.service_provider import ServiceProvider
+
+
+class AppProvider(ServiceProvider):
+    def boot(self):
+        limiter = self.app.make("limiter")
+        limiter.register("api", api_quota)
+
+
+def api_quota(request):
+    plan = plan_for(request)          # your lookup
+    if plan == "enterprise":
+        return Limit.none()           # exempt
+    if plan == "pro":
+        return Limit.per_minute(600)
+    return Limit.per_minute(60)
+```
+
+```python
+@router.get("/v1/search", dependencies=[Depends(throttle("api"))])
+async def search():
+    ...
+```
+
+The resolver only chooses the *rule*; the caller key still comes from the default (or from `key=`, if the route passes one), so each user counts against their own bucket at their own ceiling.
+
+### A global cap alongside a per-caller cap
+
+Per-caller limits stop one client from monopolising an endpoint; they do nothing about ten thousand clients arriving at once. Pass both, and give the global one a fixed `.by()` so every caller shares it:
+
+```python
+from alata.rate_limiting import Limit
+
+@router.post(
+    "/render",
+    dependencies=[Depends(throttle([
+        Limit.per_minute(10),                  # per caller
+        Limit.per_minute(500).by("global"),    # everyone, one bucket
+    ]))],
+)
+async def render():
+    ...
+```
+
+<Callout type="info">
+Order matters. Limits are evaluated in the order you list them and the first rejection short-circuits the rest, so putting the per-caller limit **first** means a caller who is already over their own quota never spends any of the shared budget. Listing the global cap first has the opposite effect: abusive traffic burns the pool that legitimate callers need.
+</Callout>
+
+## Named limiters
+
+A named limiter is a reusable, request-aware policy: a name mapped to a resolver. Register them in a provider's `boot()`, once all bindings exist:
+
+```python title="app/providers/app_provider.py"
+from alata.rate_limiting import Limit
+from alata.support.service_provider import ServiceProvider
+
+from app.http.throttling import client_ip
+
+
+class AppProvider(ServiceProvider):
+    def boot(self):
+        limiter = self.app.make("limiter")
+
+        limiter.register("api", lambda request: Limit.per_minute(60).by(client_ip(request)))
+        limiter.register("uploads", lambda request: Limit.per_hour(20))
+        limiter.register("webhooks", lambda request: "100/minute")
+```
+
+Reference one by name anywhere a rate string would go — `throttle()` tells them apart by the `/`:
+
+```python
+@router.post("/upload", dependencies=[Depends(throttle("uploads"))])
+async def upload():
+    ...
+```
+
+A resolver receives the request and may return a single `Limit`, a list of them, or a rate string. Unlike a rate string passed directly, a name is resolved on **every request**, which is what lets the policy depend on the caller.
+
+Return `Limit.none()` to exempt a caller entirely:
+
+```python
+limiter.register("api", lambda request: Limit.none() if is_internal(request) else Limit.per_minute(60))
+```
+
+<Callout type="warn">
+Referencing a name that was never registered is a server misconfiguration, not a client fault, so it raises and surfaces as a `500` on the first request to that route — not at startup. Register limiters in `boot()`, before any traffic arrives.
+</Callout>
+
+## Multiple limits on one route
+
+Pass a list to enforce several shapes at once — a short burst ceiling plus a longer-horizon quota is the common pairing:
+
+```python
+from alata.rate_limiting import Limit
+
+throttle([Limit.per_second(5), Limit.per_minute(100)])
+```
+
+Every limit gets its own bucket and its own counter. They are checked in order and the first one to reject wins, so the strictest limit for the current traffic shape is the one that answers. The `X-RateLimit-*` headers on a rejected response describe the limit that rejected; on a successful response they describe the *last* limit in the list, so put the limit you most want callers to see at the end.
+
+## Limiting anything that is not a route
+
+The limiter is a container singleton, and nothing about it is HTTP-specific. Use it directly for domain actions — OTP sends, password attempts, invite emails, expensive report generation. Every operation has a sync form and an `a`-prefixed async twin:
+
+```python title="app/services/otp.py"
+from alata.container import container
+from alata.exceptions import UnprocessableError
+
+
+async def send_otp(user_id: int) -> None:
+    limiter = container.make("limiter")
+    key = f"otp:{user_id}"
+    if not await limiter.aattempt(key, max_attempts=3, decay_seconds=300):
+        wait = await limiter.aavailable_in(key)
+        raise UnprocessableError(f"Too many codes requested. Try again in {wait} seconds.")
+
+    await deliver_otp(user_id)
+```
+
+Clearing the bucket on success is the other half of the pattern — a caller who gets their password right should not stay locked out:
+
+```python title="app/services/auth.py"
+from alata.exceptions import AuthenticationError, UnprocessableError
+
+
+async def authenticate(email: str, password: str):
+    limiter = container.make("limiter")
+    key = f"login:{email}"
+    if await limiter.atoo_many_attempts(key, max_attempts=5):
+        raise UnprocessableError("Too many failed attempts.")
+
+    user = await attempt_login(email, password)
+    if user is None:
+        await limiter.ahit(key, decay_seconds=900)
+        raise AuthenticationError("Invalid credentials.")
+
+    await limiter.aclear(key)
+    return user
+```
+
+| Method (async twin) | Purpose |
+| --- | --- |
+| `attempt(key, max_attempts, decay_seconds)` (`aattempt`) | Consume one attempt if available — `True` when allowed. One atomic store operation; a rejected attempt still increments. `max_attempts <= 0` allows nothing |
+| `hit(key, decay_seconds)` (`ahit`) | Increment unconditionally; returns the new count |
+| `too_many_attempts(key, max_attempts)` (`atoo_many_attempts`) | Has the key exhausted its attempts? |
+| `attempts(key)` (`aattempts`) | Current count in the window |
+| `remaining(key, max_attempts)` (`aremaining`) | Attempts left |
+| `available_in(key)` (`aavailable_in`) | Seconds until the window resets |
+| `clear(key)` (`aclear`) | Drop the bucket |
+
+`acheck(limit, base_key)` is the one operation with no sync twin — it takes a `Limit` and returns the `(allowed, remaining, retry_after)` tuple the HTTP layer turns into headers. Reach for it when you want a `Limit` object's semantics outside a route; reach for `aattempt` for everything else.
+
+## Configuration
+
+Optional `config/rate_limit.py` — omit it entirely for the defaults:
+
+```python title="config/rate_limit.py"
+RATE_LIMIT_CONFIG = {
+    "store": None,             # cache store name; None = the cache default
+    "prefix": "rate_limit:",   # key namespace
+}
+```
+
+The limiter rides the [cache abstraction](/docs/digging-deeper/cache): `store` names any store from `CACHE_CONFIG["stores"]`, and `None` (the default) shares whatever store the cache itself defaults to. No extra connections, no separate backend to configure — the limiter follows your cache. `prefix` namespaces its keys so limiter counters and ordinary cache entries never collide.
+
+The store you land on decides what "60 per minute" actually bounds:
+
+| Store driver | Counter scope | Suited for |
+| --- | --- | --- |
+| `redis` | Atomic, shared across all workers and servers | Production |
+| `database` | Atomic upsert counters, shared across all workers and servers | Production — a solid Redis alternative when you already run a database |
+| `file` | Per-server; increments serialized through a guard file | Single-server deployments |
+| `memory` | Per-process — each worker enforces its own window | Development, tests, single-worker setups |
+| `null` | No counters at all — **rate limiting is a no-op** (the provider logs a warning) | Environments that deliberately disable limiting |
+
+```python
+RATE_LIMIT_CONFIG = {"store": "redis"}   # pin a specific cache store
+```
+
+<Callout type="warn">
+A "60/minute" limit on the `memory` driver is 60 per minute *per worker*, and on `file` it is per server. Four workers on `memory` means the endpoint actually admits 240. Point the limiter (or your cache default) at `redis` or `database` whenever more than one worker serves traffic.
+</Callout>
+
+## Production notes
 
 ### Behind a reverse proxy
 
@@ -125,136 +426,97 @@ async def search():
     ...
 ```
 
-Authenticated traffic sidesteps the problem entirely — once [IdentityMiddleware](/docs/basics/middleware) resolves a user id, the default key uses it and never looks at the address. Listening on a TCP port with `--proxy-headers` enabled on the server is the other way out.
-
-### Multiple limits
-
-A list applies every limit — the strictest one rejects first:
-
-```python
-throttle([Limit.per_second(5), Limit.per_minute(100)])
-```
-
-## Named limiters
-
-Define reusable, request-aware policies once — typically in a provider's `boot()` — and reference them by name:
-
-```python title="app/providers/app_provider.py"
-from alata.rate_limiting import Limit
-
-def boot(self):
-    limiter = self.app.make("limiter")
-
-    # client_ip() from "Behind a reverse proxy" above — never assume
-    # request.client is set.
-    limiter.register("api", lambda request: Limit.per_minute(60).by(client_ip(request)))
-    limiter.register("uploads", lambda request: Limit.per_hour(20))
-```
-
-```python
-@router.post("/upload", dependencies=[Depends(throttle("uploads"))])
-```
-
-A resolver receives the request and returns a `Limit` (or a list). Return `Limit.none()` to exempt a caller entirely:
-
-```python
-limiter.register("api", lambda request: Limit.none() if is_internal(request) else Limit.per_minute(60))
-```
-
-## The Limit object
-
-```python
-from alata.rate_limiting import Limit
-
-Limit.per_second(10)
-Limit.per_minute(60)
-Limit.per_minutes(5, 10)    # 10 attempts per 5 minutes
-Limit.per_hour(1000)
-Limit.per_day(10000)
-Limit.per_minute(60).by(user_id)   # scope the bucket to a caller
-Limit.none()                        # exempt — the unlimited sentinel
-Limit(0, 60)                        # closed — every request rejected
-```
-
-`by()` returns a new `Limit` — they're immutable values, safe to share.
-
-`Limit.none()` is the *only* way to build an unlimited limit. A count of zero is not a synonym for it: `Limit(0, 60)` rejects everything, matching `limiter.attempt(key, max_attempts=0, ...)`, which has always returned `False`. Exempting a route and closing it are opposite intents, so they get opposite spellings.
-
-## Limiting anything else
-
-The limiter itself is a container singleton — use it directly for domain-level limits. Every operation has a sync form and an `a`-prefixed async twin:
-
-```python
-from alata.container import container
-
-limiter = container.make("limiter")
-
-if not await limiter.aattempt(f"otp:{user_id}", max_attempts=3, decay_seconds=300):
-    wait = await limiter.aavailable_in(f"otp:{user_id}")
-    raise UnprocessableError(f"Try again in {wait} seconds.")
-
-send_otp(user_id)
-```
-
-| Method (async twin) | Purpose |
-| --- | --- |
-| `attempt(key, max_attempts, decay_seconds)` (`aattempt`) | Consume one attempt if available — `True` when allowed. One atomic store operation; a rejected attempt still increments. `max_attempts <= 0` allows nothing |
-| `hit(key, decay_seconds)` (`ahit`) | Increment unconditionally; returns the new count |
-| `too_many_attempts(key, max_attempts)` (`atoo_many_attempts`) | Has the key exhausted its attempts? |
-| `attempts(key)` (`aattempts`) | Current count in the window |
-| `remaining(key, max_attempts)` (`aremaining`) | Attempts left |
-| `available_in(key)` (`aavailable_in`) | Seconds until the window resets |
-| `clear(key)` (`aclear`) | Drop the bucket |
-
-## Configuration
-
-Optional `config/rate_limit.py` — omit it entirely for the defaults:
-
-```python title="config/rate_limit.py"
-RATE_LIMIT_CONFIG = {
-    "store": None,             # cache store name; None = the cache default
-    "prefix": "rate_limit:",   # key namespace
-}
-```
-
-The limiter rides the [cache abstraction](/docs/digging-deeper/cache): `store` names any store from `CACHE_CONFIG["stores"]`, and `None` (the default) shares whatever store the cache itself defaults to. No extra connections, no separate backend to configure — the limiter follows your cache. The trade-offs per driver:
-
-| Store driver | Counter scope | Suited for |
-| --- | --- | --- |
-| `redis` | Atomic, shared across all workers and servers | Production |
-| `database` | Atomic upsert counters, shared across all workers and servers | Production — a solid Redis alternative when you already run a database |
-| `file` | Per-server; increments serialized through a guard file | Single-server deployments |
-| `memory` | Per-process — each worker enforces its own window | Development, tests, single-worker setups |
-| `null` | No counters at all — **rate limiting is a no-op** (the provider logs a warning) | Environments that deliberately disable limiting |
-
-```python
-RATE_LIMIT_CONFIG = {"store": "redis"}   # pin a specific cache store
-```
-
-<Callout type="warn">
-A "60/minute" limit on the `memory` driver is 60 per minute *per worker*, and on `file` it is per server. Point the limiter (or your cache default) at `redis` or `database` whenever more than one worker serves traffic.
-</Callout>
+Authenticated traffic sidesteps the problem entirely — once a [middleware](/docs/basics/middleware) resolves a user id into the request context, the default key uses it and never looks at the address. Listening on a TCP port with `--proxy-headers` enabled on the server is the other way out.
 
 ### When the backend is down
 
 If the store cannot count — a Redis outage, or the `null` store — the limiter **fails open**: requests are admitted rather than rejected, because a cache outage should not take the application down with it. That is a deliberate trade, not a silent one: the limiter logs a `WARNING` once per process saying rate limiting is degraded and not being enforced. Alert on that line — while it is firing, your limits do not exist.
 
+<Callout type="info">
+The limiter counts requests; it is not a spend or quota system. For budget-style enforcement (cost per period), model quotas in your domain — the limiter's job is protecting endpoints and actions from bursts.
+</Callout>
+
 ## Testing
 
-`RateLimiter.fake()` gives an in-memory limiter with a swappable clock (`limiter.store.now`) — bind it in the container and no backend is needed:
+`RateLimiter.fake()` gives an in-memory limiter that needs no backend. Bind it in the container and your routes are throttled by a store you control:
 
 ```python
 from alata.container import container
 from alata.rate_limiting import RateLimiter
 
-def test_rate_limited_endpoint(fresh_container):
+
+def test_search_is_throttled(fresh_container):
     limiter = RateLimiter.fake()
-    limiter.store.now = lambda: 1000.0   # freeze time to assert on windows
     container.instance("limiter", limiter)
 
     assert client.get("/search").status_code == 200
 ```
 
+The store's clock is a plain attribute, so you can freeze it and step it forward instead of sleeping through a real window:
+
+```python
+def test_window_reopens(fresh_container):
+    limiter = RateLimiter.fake()
+    now = {"t": 1000.0}
+    limiter.store.now = lambda: now["t"]
+    container.instance("limiter", limiter)
+
+    assert client.get("/limited").status_code == 200
+    assert client.get("/limited").status_code == 200
+    assert client.get("/limited").status_code == 429
+
+    now["t"] += 61                      # the window has expired
+    assert client.get("/limited").status_code == 200
+```
+
+`RateLimiter.in_memory(prefix="...")` is the same thing with a key prefix, useful when several limiters share a store in one test process.
+
+## How it works
+
+Everything above is enough to use the limiter. This section is what to read before you pick a number.
+
+### A fixed window
+
+Alata counts attempts in a **fixed window**. The first attempt for a key opens a window, the counter increments on every attempt, and the whole counter disappears when the window expires. It is the right default: one counter per key, one round trip per decision, no per-request bookkeeping to store or prune.
+
+Its trade-off is worth knowing. A window is anchored to a key's first attempt, not to a wall clock, and it resets all at once — so traffic can cluster on either side of a reset:
+
+```text
+60/minute, window opened at t=0
+  t=59.5s   59 attempts   → allowed (fills the window)
+  t=60.0s   window expires
+  t=60.5s   60 attempts   → allowed (a fresh window)
+  ──────────────────────────────────────────────────
+  119 attempts inside a ~1 second span
+```
+
+Nothing is broken here — each window honored its own limit. But "60 per minute" bounds *a window*, not *any 60-second span*, and the worst case is close to twice the nominal rate. Size limits with that in mind: if a burst of 2× would hurt, set the limit at half what the endpoint can survive, or use a shorter window (`Limit.per_minutes(1, 60)` and `Limit.per_second(1)` bound the same average rate very differently).
+
 <Callout type="info">
-The limiter counts requests; it is not a spend or quota system. For budget-style enforcement (cost per period), model quotas in your domain — the limiter's job is protecting endpoints and actions from bursts.
+**When a fixed window is not enough.** A smoother shape — a sliding window, or a token bucket that refills continuously and allows a controlled burst — costs more state and more work per request. That belongs at the edge, in the API gateway or CDN that already sees every request, not in the application process. Use this limiter to protect *your* endpoints and domain actions; use the edge for traffic shaping.
 </Callout>
+
+### How admission is decided
+
+Every admission decision comes from the counter's own increment, in one operation:
+
+```text
+count = increment(bucket, 1, ttl=window)   # atomic, returns the post-hit count
+allowed = count <= max_attempts
+```
+
+The limiter never reads the counter and then writes it. That pair is two round trips to the store, and in the gap between them every concurrent request sees the same empty bucket — a limit of 1 would admit as many requests as arrive at once, which is exactly the burst a limiter exists to stop. Deciding from the value the store hands back makes the check and the consume the same operation.
+
+The first hit of a window also sets that window's expiry in the *same* store operation, so on an atomic backend like Redis concurrent requests can never create a bucket that never expires.
+
+Two consequences follow, and both are deliberate:
+
+<Callout type="info">
+**A rejected attempt still increments the counter.** This is the price of deciding atomically. A caller that keeps hammering a closed bucket keeps pushing the count up, so the count can exceed `max_attempts` — `remaining` clamps at 0, so `X-RateLimit-Remaining` never goes negative. The window is unaffected: it still expires on its original schedule, because the store never extends a TTL on a later increment.
+</Callout>
+
+An allowed request costs exactly one store round trip. A rejected one costs a second, to read how long is left in the window for `Retry-After`.
+
+### Retry-After is never zero
+
+A blocked response always carries `Retry-After: 1` or more (and `X-RateLimit-Reset` matches it). The remaining window is whole seconds, so a bucket with 300 ms left would otherwise round to `0` — and a client honoring `Retry-After: 0` retries immediately, hot-looping against a limit it cannot pass. Waiting one second too long is harmless; waiting zero is not. Only the header is floored: `available_in()` keeps reporting the raw reading.
