@@ -25,11 +25,14 @@ CACHE_CONFIG = {
     # Default store. Override via CACHE_STORE env var.
     "default": settings.CACHE_STORE,
     # Global key prefix — prevents collisions when multiple apps share a backend.
-    "prefix": getattr(settings, "CACHE_PREFIX", "alata_cache:"),
+    "prefix": settings.CACHE_PREFIX,
     # Named stores available through Cache.store(name).
     "stores": {
         "redis": {"driver": "redis", "connection": "cache"},
-        # "database": {"driver": "database", "table": "alata_cache", "connection": "default"},
+        # "table" names the cache table (locks live in "{table}_locks"),
+        # "connection" picks a named database connection. Requires the
+        # shipped create_cache_table migration to have run.
+        "database": {"driver": "database", "table": "alata_cache", "connection": "default"},
         "file": {"driver": "file", "path": None},
         "memory": {"driver": "memory"},
         "null": {"driver": "null"},
@@ -173,7 +176,7 @@ backend's own pattern language — `*`, `?`, `[`, `]`, `\` for Redis, `%` and
 `_` for SQL — are escaped, so `forget_by_prefix("q[abc]:")` deletes exactly
 the keys starting with `q[abc]:` and nothing else.
 
-When a global key prefix is configured, `flush` deletes only your app's prefixed keys — it will not wipe another application's data on a shared Redis, and two file stores pointed at one directory with different prefixes never clear each other. `flush` never touches locks either: clearing the cache cannot release a lock somebody is holding.
+When a global key prefix is configured, `flush` deletes only your app's prefixed keys — it will not wipe another application's data on a shared Redis, and two file stores pointed at one directory with different prefixes never clear each other. Locks are out of reach entirely: on every driver they live in a namespace of their own (see [Atomic locks](#atomic-locks)), so neither `flush` nor `forget_by_prefix` can release a lock somebody is holding — clearing the cache is not a lock reset.
 
 ### Atomic locks
 
@@ -189,6 +192,8 @@ try:
 finally:
     await Cache.unlock("reports:rebuild", owner=token)
 ```
+
+Locks are namespaced apart from values on **every** driver — a `lock:` sub-namespace under the global prefix on Redis, a table of their own on the memory store, separate `locks/` files on the file store, and the companion `{table}_locks` table on the database store. A lock and a cache value under the same logical key are different entries that never interact: writing or forgetting the value cannot release the lock, holding the lock never shadows the value, and `flush`/`forget_by_prefix` operate on values only.
 
 The `strict_locking` config key decides what happens when Redis is unavailable: with `True` (the default) `lock` returns `None` — acquisition fails, so uncoordinated concurrent execution is impossible; with `False` it returns a synthetic token and lets the operation proceed, which suits idempotent work like scheduling mutexes.
 

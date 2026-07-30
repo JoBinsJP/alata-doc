@@ -73,13 +73,13 @@ class FastapiProvider(HttpProvider):
                 exclude_paths=REQUEST_LOGGING.get("exclude_paths"),
                 slow_threshold=REQUEST_LOGGING.get("slow_request_threshold", 5.0),
             )
-        # ... GZip, TrustedHost, CORS, IdentityMiddleware
+        # ... GZip, TrustedHost, CORS, IdentityMiddleware, RateLimitHeadersMiddleware
 ```
 
 Because the middleware stack is plain code in *your* provider, adding, removing, or reordering middleware never requires touching the framework.
 
 <Callout type="info">
-`add_middleware` builds the stack outside-in: the **last** middleware added is the outermost and runs **first** on each request. The scaffold adds `IdentityMiddleware` last so the acting user is already resolved by the time request logging (added earlier) writes its line.
+`add_middleware` builds the stack outside-in: the **last** middleware added is the outermost and runs **first** on each request. The scaffold adds `IdentityMiddleware` after request logging so the acting user is already resolved by the time the log line is written, and `RateLimitHeadersMiddleware` last of all — it replays the [rate limiter's](/docs/digging-deeper/rate-limiting) `X-RateLimit-*` headers onto responses that endpoints construct themselves, and only the outermost middleware sees the final response.
 </Callout>
 
 ## Maintenance Mode
@@ -156,16 +156,30 @@ Middleware is a standard ASGI `BaseHTTPMiddleware` subclass with a `dispatch` me
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
+from alata.context import user_id_context
+
 
 class IdentityMiddleware(BaseHTTPMiddleware):
-    """Resolve the acting user from headers into request.state."""
+    """Resolve the acting user from headers into request.state and the request context."""
 
     async def dispatch(self, request: Request, call_next):
         user_id = request.headers.get("X-User-Id")
         guest_id = request.headers.get("X-Guest-Id")
-        request.state.user_id = user_id or guest_id or "anonymous"
-        return await call_next(request)
+        identity = user_id or guest_id  # None when neither header is present
+
+        request.state.user_id = identity or "anonymous"
+        if identity is None:
+            # Context untouched: throttling falls back to per-client-IP keys.
+            return await call_next(request)
+
+        token = user_id_context.set(identity)
+        try:
+            return await call_next(request)
+        finally:
+            user_id_context.reset(token)
 ```
+
+It publishes the identity two ways. `request.state.user_id` always has a value — the `"anonymous"` fallback keeps display and logging simple. The `user_id_context` [context variable](/docs/digging-deeper/context) is set only for *real* identities (a user id, or a per-session guest id) and is reset after the response so identity never leaks between requests sharing a worker. The [rate limiter](/docs/digging-deeper/rate-limiting) keys buckets on the context variable, which is why the constant fallback never goes there.
 
 Everything before `await call_next(request)` runs on the way in; everything after runs on the way out, with the response in hand:
 

@@ -148,11 +148,19 @@ from alata.context import user_id_context
 
 class IdentityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        user_id = request.headers.get("X-User-Id") or "anonymous"
-        request.state.user_id = user_id
-        user_id_context.set(user_id)
-        return await call_next(request)
+        user_id = request.headers.get("X-User-Id")
+        request.state.user_id = user_id or "anonymous"  # state always has a value
+        if user_id is None:
+            return await call_next(request)  # context stays unset for anonymous callers
+
+        token = user_id_context.set(user_id)
+        try:
+            return await call_next(request)
+        finally:
+            user_id_context.reset(token)
 ```
+
+Note the asymmetry: the `"anonymous"` fallback goes on `request.state` only, for display and logging. The context variable is set only for real identities — the [rate limiter](/docs/digging-deeper/rate-limiting) keys buckets on it, and a shared constant would put every anonymous caller into a single bucket.
 
 ```python title="app/services/audit.py"
 from alata.context import user_id_context

@@ -31,12 +31,18 @@ from alata.context import user_id_context
 
 class IdentityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        token = user_id_context.set(resolve_user_id(request))  # your auth logic
+        identity = resolve_user_id(request)  # your auth logic; None when anonymous
+        if identity is None:
+            return await call_next(request)  # leave the context unset
+
+        token = user_id_context.set(identity)
         try:
             return await call_next(request)
         finally:
             user_id_context.reset(token)
 ```
+
+Set `user_id_context` only when a *real* identity was resolved — an authenticated user id, or a per-session guest id — never a fallback constant like `"anonymous"`. The [rate limiter](/docs/digging-deeper/rate-limiting) keys its buckets on this variable, so a constant would merge every unauthenticated caller into one shared bucket; left unset, those callers are keyed per client IP instead.
 
 `request_context` works the same way — stash whatever per-request dict you find useful (request id, tenant, locale) and read it downstream.
 
