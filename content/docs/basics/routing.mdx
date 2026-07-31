@@ -16,7 +16,7 @@ A fresh application ships one route file, `routes/api.py`, containing a single t
 
 ```python title="routes/api.py"
 from app.http.controllers.welcome_controller import WelcomeController
-from fastapi import APIRouter
+from alata.http import APIRouter
 
 api_router = APIRouter(prefix="/api/v1")
 welcome_controller = WelcomeController()
@@ -24,10 +24,14 @@ welcome_controller = WelcomeController()
 api_router.get("/")(welcome_controller.index)
 ```
 
+<Callout type="info">
+`APIRouter`, `Depends`, `Request`, `Response` and `JSONResponse` are the underlying toolkit's own objects, re-exported through `alata.http` so application code imports one namespace. Importing them from `fastapi` directly is equally supported — they are the same objects, and every FastAPI extension keeps working.
+</Callout>
+
 Controllers are plain classes with async methods:
 
 ```python title="app/http/controllers/welcome_controller.py"
-from fastapi import Request
+from alata.http import Request
 
 
 class WelcomeController:
@@ -116,7 +120,7 @@ You have two complementary injection mechanisms.
 Use FastAPI dependencies for values derived from the current request. The scaffold ships two in `app/http/dependencies.py`:
 
 ```python title="routes/api.py"
-from fastapi import Depends
+from alata.http import Depends
 
 from app.http.dependencies import get_user_id, require_authenticated
 
@@ -162,7 +166,7 @@ The two mechanisms compose: use `Depends` for per-request data, the container fo
 Group related routes into their own routers and compose them. Prefixes nest, and `tags` group the routes in the generated API docs:
 
 ```python title="routes/orders.py"
-from fastapi import APIRouter
+from alata.http import APIRouter
 
 orders_router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -182,7 +186,7 @@ api_router.include_router(orders_router)   # served at /api/v1/orders
 You can also apply a prefix at mount time — `include_router(admin_router, prefix="/admin")` — or attach shared guards to a whole group with router-level dependencies:
 
 ```python
-from fastapi import APIRouter, Depends
+from alata.http import APIRouter, Depends
 
 from app.http.dependencies import require_authenticated
 

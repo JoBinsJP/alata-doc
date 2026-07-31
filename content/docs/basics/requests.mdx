@@ -107,7 +107,7 @@ Declaring `response_model` also filters the OpenAPI schema, so `/docs` shows exa
 `FormRequest` covers the JSON body. For everything else about the incoming request — headers, cookies, the client address, the raw URL — type-hint the standard `Request` object in any handler:
 
 ```python
-from fastapi import Request
+from alata.http import Request
 
 
 @api_router.get("/whoami")

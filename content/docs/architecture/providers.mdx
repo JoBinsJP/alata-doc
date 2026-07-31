@@ -93,7 +93,7 @@ Runs only when an HTTP kernel is attached, and receives the FastAPI application 
 
 ```python
 def boot_http(self, app) -> None:
-    from fastapi import APIRouter
+    from alata.http import APIRouter
 
     router = APIRouter(tags=["reports"])
 

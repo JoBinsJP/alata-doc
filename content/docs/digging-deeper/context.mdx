@@ -24,7 +24,7 @@ Both default to `None`. The framework declares them but does **not** populate th
 Set a variable with `.set()`, which returns a token, and restore the previous value with `.reset(token)` when the request ends:
 
 ```python title="app/http/middleware.py"
-from starlette.middleware.base import BaseHTTPMiddleware
+from alata.http import BaseHTTPMiddleware
 
 from alata.context import user_id_context
 

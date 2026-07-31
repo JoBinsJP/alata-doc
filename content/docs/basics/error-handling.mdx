@@ -177,7 +177,7 @@ class Handler(ExceptionHandler):
 Register a callback in `register()` with `self.renderable()`. The handler inspects the callback's **first parameter's type hint** to know which exception it maps — no explicit registration key needed:
 
 ```python title="app/exceptions/handler.py"
-from fastapi.responses import JSONResponse
+from alata.http import JSONResponse
 
 from app.exceptions.errors import InvalidOrderError
 

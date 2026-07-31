@@ -62,12 +62,10 @@ The `queue:*` family is covered in depth on the [queues page](/docs/digging-deep
 
 ## Writing commands
 
-A command is a class extending `Command` from `alata.foundation.console`. Declare a `name` and `description`, optionally declare `arguments` and `options`, and implement `handle()`:
+A command is a class extending `Command` from `alata.console`. Declare a `name` and `description`, optionally declare `arguments` and `options`, and implement `handle()`:
 
 ```python title="app/console/commands/send_report.py"
-from cleo.helpers import argument, option
-
-from alata.foundation.console import Command
+from alata.console import Command, argument, option
 
 
 class SendReportCommand(Command):
@@ -114,7 +112,7 @@ A few things to notice:
 ```python title="app/console/commands/prune_sessions.py"
 import asyncio
 
-from alata.foundation.console import Command
+from alata.console import Command
 
 
 class PruneSessionsCommand(Command):

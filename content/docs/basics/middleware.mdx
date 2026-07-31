@@ -153,8 +153,7 @@ In `config/middleware.py`, `REQUEST_LOGGING` supports:
 Middleware is a standard ASGI `BaseHTTPMiddleware` subclass with a `dispatch` method. The scaffold's `IdentityMiddleware` is a complete example:
 
 ```python title="app/http/middleware.py"
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
+from alata.http import BaseHTTPMiddleware, Request
 
 from alata.context import user_id_context
 

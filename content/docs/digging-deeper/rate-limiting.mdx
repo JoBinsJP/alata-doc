@@ -7,9 +7,7 @@ icon: Gauge
 Alata includes a rate limiter for throttling HTTP routes and for limiting any other action — OTP sends, login attempts, report generation. Counters live on your [cache store](/docs/digging-deeper/cache), so there is no separate backend to run.
 
 ```python title="routes/api.py"
-from fastapi import APIRouter, Depends
-
-from alata.http.throttle import throttle
+from alata.http import APIRouter, Depends, throttle
 
 router = APIRouter()
 
@@ -78,7 +76,7 @@ Publish real identities only (a per-session guest id counts as real). A middlewa
 Pass `key=` to take over how callers are identified — a callable receiving the request and returning a string:
 
 ```python title="app/http/throttling.py"
-from fastapi import Request
+from alata.http import Request
 
 
 def client_ip(request: Request) -> str:
