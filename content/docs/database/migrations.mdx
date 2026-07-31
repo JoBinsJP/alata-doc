@@ -195,8 +195,32 @@ table.string("code", 10).primary()
 | `.primary()` | Mark as primary key |
 | `.unique()` | Single-column unique constraint |
 | `.unsigned()` | Adds a `CHECK (col >= 0)` constraint |
+| `.case_sensitive()` | Compare this text column exactly — see below |
 | `.after(column)` | Ordering hint (no-op on most backends) |
 | `.change()` | In ALTER mode: modify this existing column instead of adding it. Constraints chained alongside it (`.unique()`, `.unsigned()`) are emitted, not dropped |
+
+### Exact text comparison
+
+MySQL's default collation (`utf8mb4_0900_ai_ci`) compares text case- *and*
+accent-insensitively, so `User:ABC`, `user:abc` and `user:abç` are the same
+value. For a display name that is usually what you want; for a key it is a
+bug — one principal reads another's cached entry, separate rate-limit buckets
+merge into one, and a lookup matches a row it was never meant to.
+
+`.case_sensitive()` asks for exact comparison and lets each backend decide
+what that requires:
+
+```python
+with schema.create("api_tokens") as table:
+    table.string("token").primary().case_sensitive()
+```
+
+MySQL gets `CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`. PostgreSQL and SQLite
+already compare byte-for-byte, so nothing is emitted for them — the modifier
+states the requirement rather than a collation name, so the same migration is
+correct on every backend. It applies on both the create and ALTER paths, and
+raises on a non-text column rather than passing silently on the two backends
+that would have ignored it.
 
 ### Database-level defaults
 
@@ -272,7 +296,7 @@ Three of these carry a dialect caveat:
 
 - **`drop_primary()` on MySQL costs the column its `AUTO_INCREMENT`.** MySQL refuses to drop the key an auto-increment column depends on, so the framework gives up `AUTO_INCREMENT` first (the column keeps its type, nullability and comment) and then drops the key. If the replacement key should keep generating values, re-declare the column. PostgreSQL is unaffected.
 - **`drop_unique()` on SQLite only works for a unique that was added to an existing table.** A unique declared inside `create()` becomes a table-level constraint that SQLite has no statement to drop; the migration raises rather than reporting a drop it did not make. Removing one needs a table rebuild: create a replacement table without the constraint, copy the rows across, drop the original, rename the replacement.
-- **Column comments are unavailable on MySQL.** MySQL has no standalone `COMMENT ON` — setting one requires restating the whole column definition — so `table.comment(...)` and `schema.comment(...)` raise `NotImplementedError` there. Table comments (`schema.table_comment(...)`) work on every dialect.
+- **Column comments are silently unavailable on SQLite.** SQLite has no column-comment syntax and stores nothing for one, so `table.comment(...)` and `schema.comment(...)` run without error and keep nothing. MySQL and PostgreSQL both persist them: MySQL has no standalone `COMMENT ON`, so the framework reads the column's current definition and restates it — type, nullability, default, character set and collation, `AUTO_INCREMENT`, generation expression and spatial SRID all survive.
 
 ### Concurrent indexes
 
