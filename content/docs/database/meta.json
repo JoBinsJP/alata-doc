@@ -1,5 +1,5 @@
 {
   "title": "Database",
   "icon": "Database",
-  "pages": ["getting-started", "query-builder", "models", "migrations"]
+  "pages": ["getting-started", "query-builder", "models", "migrations", "seeding"]
 }

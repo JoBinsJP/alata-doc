@@ -41,7 +41,9 @@ The framework registers this command set out of the box:
 | `migrate:sync` | Mark all existing migrations as run without executing SQL. |
 | `migrate:status` | Show the status of all migrations. |
 | `make:migration <name>` | Generate a new migration file. |
+| `make:seeder <name>` | Generate a new database seeder class. |
 | `make:provider <name>` | Generate a service provider and register it in `bootstrap/providers.py`. |
+| `db:seed` | Seed the database with reference/development data (`--seeder` to run one). |
 | `db:status` | Display connection pool metrics for all database connections. |
 | `up` | Bring the application out of maintenance mode. |
 | `down` | Put the application into maintenance mode. |
@@ -194,6 +196,7 @@ Framework commands also carry a shared `-C/--config` option that points database
 The `make:*` commands scaffold files into your project:
 
 - **`make:migration <name>`** — generates a timestamped migration file. Name it after the change, e.g. `./alata make:migration create_users_table`. See [database getting started](/docs/database/getting-started).
+- **`make:seeder <name>`** — generates a seeder class in `database/seeders/`. Either naming style works: `user`, `user_seeder`, and `UserSeeder` all produce `user_seeder.py` with a `UserSeeder` class. See [seeding](/docs/database/seeding).
 - **`make:provider <name>`** — generates `app/providers/<name>_provider.py` from a stub **and** appends it to the `PROVIDERS` list in `bootstrap/providers.py`, so it boots immediately:
 
 ```bash

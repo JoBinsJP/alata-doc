@@ -208,6 +208,8 @@ User.upsert(
 )   # INSERT ... ON CONFLICT (email) DO UPDATE SET name
 ```
 
+Omitting `update_cols` updates only the columns the supplied rows name, minus `unique_by`, the primary key, and `created_at` — see [Upserts](/docs/database/query-builder#upserts) for the full contract.
+
 Async: `ainsert`, `aupsert`.
 
 ### `first_or_create` and `update_or_create`
@@ -221,6 +223,18 @@ plan = Plan.update_or_create({"user_id": user.id}, {"tier": "pro"})
 ```
 
 Both run the create inside a transaction and gracefully recover if a concurrent request wins the race on a unique constraint. Async: `afirst_or_create`, `aupdate_or_create`.
+
+`update_or_create` routes **both** branches through the model, so the two behave identically: `__fillable__` filters `update_data` whether the row existed or not, and the update path fires the full `updating` / `saving` / `updated` / `saved` cycle just as the create path fires `creating` / `saving` / `created` / `saved`.
+
+<Callout type="warn">
+A column missing from `__fillable__` is silently dropped from the update branch. To write a guarded column, add it to `__fillable__` or assign it and `save()` explicitly.
+</Callout>
+
+The same filter is available on its own as `fill()`, which assigns mass-assignable keys without persisting:
+
+```python
+user.fill(request_data).save()
+```
 
 ### Updating via queries
 
@@ -254,7 +268,7 @@ user.is_clean()
 user.get_original("name")   # value as last read from / written to the database
 
 fresh = user.fresh()        # re-fetch this row (returns a new instance)
-copy  = user.replicate()    # clone without the primary key — save() inserts a new row
+copy  = user.replicate()    # clone without the primary key or timestamps
 ```
 
 Async: `afresh()`.
@@ -296,6 +310,8 @@ event.started_at.year        # 2026 — datetime, parsed from the ISO string
 ```
 
 Supported cast types: `"json"` / `"list"` / `"dict"`, `"integer"` / `"int"`, `"float"`, `"decimal"`, `"boolean"` / `"bool"`, `"string"` / `"str"`, `"datetime"`, `"date"`.
+
+A value a cast cannot handle raises a `ValueError` naming the cast, the value and the column — `Cannot cast 'abc' to decimal for column 'amount'.` — on both the read and the write side, rather than a driver-level error you had no reason to catch.
 
 The `"decimal"` cast returns `decimal.Decimal` values on read and writes exact decimals to the database — the natural pairing for `NUMERIC` money and rate columns. Floats are converted through their string form, so `0.1` becomes `Decimal("0.1")` rather than the binary-float expansion.
 
@@ -552,7 +568,7 @@ A few things to know:
 
 - **`attach()` never de-duplicates.** It is a plain INSERT with no existence check, so attaching an already-attached id inserts a second pivot row (and passing the same id twice in one call inserts it twice). Reach for `sync()` — which attaches only what is missing — when idempotency matters, and add a unique constraint on the two pivot key columns if duplicates must be impossible.
 - Duplicate pivot rows collapse on **read**: lazy and eager loads both return one related model per distinct id, carrying the first pivot row's data. The extra rows still exist in the table, though, and `with_count()` counts them.
-- `sync()` and `toggle()` run their read and every resulting insert/delete/update inside a **single transaction**, so a failure part-way through leaves the pivot table exactly as it was. The transaction does not lock out a concurrent `sync()` on the same parent — that is what the unique constraint is for.
+- `sync()` and `toggle()` de-duplicate their input ids, so `toggle([5, 5])` acts on id `5` once. Both run their read and every resulting insert/delete/update inside a **single transaction**, so a failure part-way through leaves the pivot table exactly as it was. The transaction does not lock out a concurrent `sync()` on the same parent — that is what the unique constraint is for.
 - Pivot operations require a saved parent; on an instance without a primary-key value they raise `ValueError`.
 - `relation()` works on every relationship type as a fresh, uncached query path — `user.relation("posts").get()` always hits the database, in contrast to the cached attribute access `user.posts`.
 
@@ -786,6 +802,8 @@ Post.where("user_id", 7).only_trashed().restore()      # returns affected count
 Post.where("user_id", 7).soft_delete()                 # bulk soft delete
 ```
 
+Bulk `soft_delete()` respects the soft-delete scope, so rows already in the trash are skipped — their original `deleted_at` survives and the returned count is what this call actually deleted. Chain `with_trashed()` to re-stamp them. `restore()` bypasses the scope, as it must.
+
 Async variants exist throughout: `adelete`, `asoft_delete`, `arestore_instance`, `aforce_delete`, and `arestore` / `asoft_delete` on the query builder.
 
 <Callout type="warn">
@@ -802,4 +820,8 @@ class AuditLog(Model):
     __connection__ = "analytics"
 ```
 
-All reads and writes for the model — sync and async — route through that connection. See [Getting Started](/docs/database/getting-started) for defining connections.
+All reads and writes for the model — sync and async — route through that connection. Anything the model has to reflect follows it: many-to-many pivot tables, `where_has()` subqueries on those relationships, and `join()` against a table no model maps are all read from the model's own connection, never from `default`. See [Getting Started](/docs/database/getting-started) for defining connections.
+
+<Callout type="info">
+Reflection is synchronous, so a connection used for many-to-many relationships needs a **sync** engine even in an async-only deployment — otherwise the first pivot operation raises `TableReflectionError` naming that connection. Reflected tables are then cached per connection and table; after a migration reshapes one, call `DB._clear_table_cache()` in the same process.
+</Callout>

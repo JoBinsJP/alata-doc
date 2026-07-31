@@ -1,0 +1,106 @@
+---
+title: Seeding
+description: Populate reference and development data with rerunnable seeder classes that use your app's own models.
+icon: Sprout
+---
+
+Seeders fill the database with data your application needs to be useful — role catalogs, country lists, a development login. They live in `database/seeders/`, are rerunnable by design, and are kept separate from the schema's migration history:
+
+```python title="database/seeders/role_seeder.py"
+from alata.db import Seeder
+
+from app.models.role import Role
+
+
+class RoleSeeder(Seeder):
+    def run(self):
+        Role.upsert(
+            rows=[
+                {"slug": "admin", "name": "Administrator"},
+                {"slug": "editor", "name": "Editor"},
+            ],
+            unique_by=["slug"],
+            update_cols=["name"],
+        )
+```
+
+```bash
+./alata db:seed --seeder RoleSeeder
+```
+
+Unlike [migrations](/docs/database/migrations) — which are frozen history and must never touch application code — seeders run in **full application context**: every provider is booted, and seeding through your own [models](/docs/database/models) is the intended style. Seeders are maintained alongside the codebase and evolve with it. The dividing line: a one-time correction tied to a point in schema history belongs in a [data migration](/docs/database/migrations#data-migrations); catalogs and development data belong here.
+
+## Writing Seeders
+
+Subclass `Seeder` and implement `run()` — as either `def` or `async def`; the runner detects which and bridges accordingly. Async models work exactly as they do in route handlers:
+
+```python title="database/seeders/user_seeder.py"
+from alata.db import Seeder
+
+from app.models.user import User
+
+
+class UserSeeder(Seeder):
+    async def run(self):
+        await User.afirst_or_create(
+            {"email": "dev@example.com"},
+            {"name": "Dev User"},
+        )
+```
+
+### Idempotency
+
+Seeders must be safe to run repeatedly against the same database — that is the contract, by convention rather than enforcement. Reach for [`upsert`, `first_or_create`, or `update_or_create`](/docs/database/models#first_or_create-and-update_or_create) instead of blind inserts, so re-seeding refreshes reference data instead of duplicating it.
+
+## Composing Seeders
+
+The conventional entry point is `DatabaseSeeder` in `database/seeders/database_seeder.py` — the scaffold ships it — which composes the others with `self.call()`:
+
+```python title="database/seeders/database_seeder.py"
+from alata.db import Seeder
+
+from database.seeders.role_seeder import RoleSeeder
+from database.seeders.user_seeder import UserSeeder
+
+
+class DatabaseSeeder(Seeder):
+    def run(self):
+        self.call([RoleSeeder, UserSeeder])
+```
+
+Both forms accept a single seeder class or a list, run children in order, and let sync and async children mix freely — each child's `run()` is bridged the same way the top-level runner bridges the parent's. The pair follows the framework-wide naming rule: plain name is sync, prefix `a` to await.
+
+- From a sync `def run()`: `self.call([...])`.
+- From an `async def run()`: `await self.acall([...])`.
+
+```python
+class DatabaseSeeder(Seeder):
+    async def run(self):
+        await self.acall([RoleSeeder, UserSeeder])
+```
+
+Calling the sync form from inside an async `run()` raises immediately with a message pointing at `acall` — the mistake announces itself instead of silently skipping your seeders.
+
+## Running Seeders
+
+```bash
+./alata db:seed                      # run DatabaseSeeder
+./alata db:seed --seeder UserSeeder  # run one specific seeder
+```
+
+`--seeder` accepts a class name (`UserSeeder`), a module name (`user_seeder`), or a dotted path (`database.seeders.user_seeder.UserSeeder`). An unknown name errors and lists every seeder found in `database/seeders/`. Resolving by module name picks the seeder **defined** in that module, so the children a composer imports are never mistaken for it; a module defining several of its own raises `AmbiguousSeederError` naming the candidates, so pass a dotted path to disambiguate.
+
+A seeder that raises does not spill a traceback: the command names the innermost seeder that actually failed — not the composer you asked for — prints its error, and exits `1`. A seeder module that fails to import surfaces its own `ImportError` rather than being reported as missing.
+
+`db:seed` boots the whole application before seeding — unlike the `migrate` family's database-only boot — precisely so your models and services are available.
+
+## Generating Seeders
+
+```bash
+./alata make:seeder user
+#   CREATED  database/seeders/user_seeder.py
+```
+
+Either naming style normalizes to the same thing: `user`, `user_seeder`, and `UserSeeder` all produce `database/seeders/user_seeder.py` containing a `UserSeeder` class, stubbed with the idempotency contract in its docstring.
+
+A name that does not normalize to a Python identifier — `user-profile`, `"user profile"`, `1weird`, empty — is rejected with a non-zero exit rather than writing a file that cannot be imported.

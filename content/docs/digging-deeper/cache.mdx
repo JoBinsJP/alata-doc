@@ -66,6 +66,8 @@ match. On MySQL the migration also pins the `key` column to the
 PostgreSQL; MySQL's default collation is case- *and* accent-insensitive,
 which would let `User:ABC`, `user:abc` and `user:abç` share a single row.
 
+Only a **connectivity** failure degrades this driver into misses and no-op writes. Anything structural — the cache migration never ran, the table was renamed, a column is the wrong width — raises out of reads as loudly as it does out of writes, so a misconfigured cache announces itself instead of reading as eternally empty.
+
 Writes upsert with the database's native conflict clause, and `increment`
 is a single atomic upsert statement, so counters — including the
 [rate limiter's](/docs/digging-deeper/rate-limiting) fixed windows — are

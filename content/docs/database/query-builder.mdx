@@ -571,6 +571,7 @@ A few rules:
 - With no `order_by()` on the query, rows are ordered by the primary key ascending automatically.
 - The ordering should uniquely identify rows — include the primary key as a tie-breaker (`.order_by("created_at", "desc").order_by("id", "desc")`), or ties across a page boundary may be skipped.
 - All ordering must come from `order_by()` columns; `order_by_raw()` and `in_random_order()` raise `ValueError`.
+- Boundary values are decoded back into the ordering column's own Python type, so text, `int`, `float`, `bool`, `Decimal`, `datetime`, `date`, `time` and `UUID` columns all round-trip exactly. A column whose values a cursor cannot carry — `bytes`, `timedelta`, an `Enum` member — raises `ValueError` naming the column instead of serving a wrong page.
 - Nullable ordering columns are fine — NULLs sort last, deterministically. See below.
 - Unions are not supported — see [Unions](#unions).
 - There is no `total` key — computing it would require the full count that keyset pagination exists to avoid. Use `paginate()` when you need page numbers.
@@ -774,10 +775,32 @@ await Flight.aupsert(
 )
 ```
 
-If `update_cols` is omitted, every column except the `unique_by` columns is updated. On PostgreSQL and SQLite this compiles to `ON CONFLICT (...) DO UPDATE`; on MySQL to `ON DUPLICATE KEY UPDATE`.
+An explicit `update_cols` list is taken literally — exactly those columns are written, nothing is added. Naming the primary key or `created_at` there is allowed, and will overwrite them. `update_cols=[]` raises `ValueError`: it names nothing to write, so it is almost always an empty computation rather than intent.
+
+If `update_cols` is omitted, the conflicting row is updated with **only the columns the supplied rows actually name**, minus the `unique_by` columns, the primary key, and `created_at`. Columns the rows leave out keep their stored values, and the row keeps its primary key — so foreign keys pointing at it stay valid:
+
+```python
+await Flight.aupsert(
+    [{"departure": "Oakland", "destination": "San Diego", "price": 79}],
+    unique_by=["departure", "destination"],
+)   # SET price = excluded.price, updated_at = now()
+    # airline, seat_count, created_at, id — all untouched
+```
+
+On a model with [timestamps](/docs/database/models), `updated_at` is stamped with the current time on conflict unless the rows supply their own value.
+
+Rows that name nothing but the conflict key have nothing to write: they insert the rows that are missing and leave existing rows untouched — `ON CONFLICT DO NOTHING` on PostgreSQL and SQLite, a no-op self-assignment on MySQL.
+
+On PostgreSQL and SQLite the update compiles to `ON CONFLICT (...) DO UPDATE`; on MySQL to `ON DUPLICATE KEY UPDATE`.
+
+The returned integer is dialect-dependent and is **not** a "rows changed" figure anywhere: PostgreSQL and SQLite count 1 per row written, while MySQL counts an updated row as 2 and a row whose values did not change as 0. Do not branch on it.
 
 <Callout type="info">
 On MySQL, `unique_by` is accepted for API consistency but not used to target a specific constraint — MySQL fires the update on *any* unique-key violation.
+</Callout>
+
+<Callout type="warn">
+The default used to be *every* column except `unique_by`, derived from the table rather than the rows. That emitted `SET id = excluded.id`, reassigning the conflicting row's primary key and orphaning every foreign key referencing it; it also reset omitted columns to their column defaults and moved `created_at`, and on MySQL it failed outright on partial rows with `Unknown column 'new.id' in 'field list'`. If you were passing `update_cols` explicitly to work around any of that, the explicit list still behaves exactly as before.
 </Callout>
 
 ## Pessimistic locking

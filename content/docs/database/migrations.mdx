@@ -51,6 +51,8 @@ Every migration subclasses `Migration` and implements two methods:
 
 Inside both methods, `self.schema` is a fluent `Schema` builder bound to the current database engine. Schema operations compile through SQLAlchemy DDL, so the same migration runs on PostgreSQL, MySQL, or SQLite.
 
+One migration per file: the runner picks the `Migration` subclass **defined** in the file, so importing a shared helper base alongside it is safe. A file defining two of its own raises `AmbiguousMigrationError` naming both.
+
 ```python
 from alata.db.migrator import Migration
 
@@ -95,7 +97,9 @@ Runs every pending migration, in filename order, as a new **batch**. The other c
 
 The whole operation — teardown and re-run — happens under the migration lock, so a concurrent deploy cannot migrate into a database that is being torn down.
 
-The order is deliberate: every `down()` runs first, in reverse, and the **tracking table is dropped last**. A `down()` that fails aborts the command with the failing migrations named, and leaves the tracking table intact — the database still matches its own migration history, so `migrate:rollback` still works and nothing is orphaned. Drop failures are never swallowed: re-running migrations over surviving tables would quietly produce a schema that doesn't match its migrations.
+Only migrations the tracking table records as **applied** are reverted. A pending migration never ran, so there is nothing for its `down()` to undo — and an ALTER-style `down()` against a table that does not exist would abort the whole teardown.
+
+The order is deliberate: those `down()` methods run first, in reverse, and the **tracking table is dropped last**. Each reverted migration has its tracking row deleted as it goes, so the table always describes what is actually in the database. A `down()` that fails aborts the command with the failing migrations named and leaves the tracking table intact — the database still matches its own migration history, so `migrate:rollback` still works and nothing is orphaned. Drop failures are never swallowed: re-running migrations over surviving tables would quietly produce a schema that doesn't match its migrations.
 
 If a `down()` fails, fix it (or drop the objects by hand) and run `migrate:fresh` again.
 
@@ -121,7 +125,7 @@ Migrations are engineered for PostgreSQL and degrade gracefully elsewhere:
 
 - **Advisory locking** — before running or rolling back, the migrator takes a PostgreSQL advisory lock. If two deploy processes run `migrate` at the same time, the second blocks until the first finishes, so a migration can never run twice concurrently.
 - **Transactional DDL** — on PostgreSQL, each migration's DDL **and** its tracking-table insert run in a single transaction. If anything fails, both roll back together: no half-applied schema, no orphaned tracking rows. A failed migration exits non-zero and leaves the database exactly as it was.
-- **MySQL / SQLite** — supported as secondary dialects. MySQL DDL auto-commits (no transactional DDL) and has no advisory lock; on failure the migrator best-effort calls the migration's `down()` to clean up. A few ALTER operations are not implemented for MySQL. Run production migrations on PostgreSQL.
+- **MySQL / SQLite** — supported as secondary dialects. MySQL DDL auto-commits (no transactional DDL) and has no advisory lock; on failure the migrator best-effort calls the failing migration's own `down()` to clean up — and if that `down()` fails too, it prints recovery instructions instead of leaving you a warning line. Both dialects also decline a few ALTER operations — see the [dialect caveats](#altering-tables). Run production migrations on PostgreSQL.
 
 ```mermaid
 sequenceDiagram
@@ -166,7 +170,7 @@ with self.schema.create("posts") as table:
 | `tiny_integer(name)` | `SMALLINT` |
 | `float(name)` | `FLOAT` |
 | `decimal(name, precision=8, scale=2)` | `NUMERIC(precision, scale)` |
-| `enum(name, values)` | Dialect-portable enum (named `enum_<name>`) |
+| `enum(name, values)` | Dialect-portable enum (named `enum_<table>_<column>`) |
 | `json(name)` | `JSON` (`JSONB` on PostgreSQL) |
 | `date(name)` | `DATE` |
 | `timestamp(name, tz=False)` | `TIMESTAMP`, with time zone when `tz=True` |
@@ -192,7 +196,7 @@ table.string("code", 10).primary()
 | `.unique()` | Single-column unique constraint |
 | `.unsigned()` | Adds a `CHECK (col >= 0)` constraint |
 | `.after(column)` | Ordering hint (no-op on most backends) |
-| `.change()` | In ALTER mode: modify this existing column instead of adding it |
+| `.change()` | In ALTER mode: modify this existing column instead of adding it. Constraints chained alongside it (`.unique()`, `.unsigned()`) are emitted, not dropped |
 
 ### Database-level defaults
 
@@ -219,7 +223,9 @@ table.unique("slug")                       # uq_posts_slug
 table.unique(["user_id", "title"])         # composite unique constraint
 ```
 
-Index names follow `idx_<table>_<columns>` and unique constraints `uq_<table>_<columns>` — you'll need these names to drop them later.
+Index names follow `idx_<table>_<columns>` and unique constraints `uq_<table>_<columns>` — you'll need these names to drop them later. A column-level `.unique()` produces the same `uq_<table>_<column>` name, so it is droppable by name too; declaring the same unique both ways emits one constraint, not two.
+
+Generated names (indexes, constraints, foreign keys, enum types) are capped at 63 characters — the smallest limit among the supported dialects — and anything longer is truncated with a deterministic hash suffix. The suffix is stable across runs and identical on every dialect, so a later `drop_unique()` still names the object that was created.
 
 ### Foreign keys
 
@@ -261,6 +267,12 @@ table.comment("status", "Editorial workflow state")   # pass None to drop the co
 <Callout type="info">
 Operations run in a safe order automatically: index/constraint drops first, then column adds/changes/renames/drops, then new indexes and foreign keys. You don't have to sequence them by hand.
 </Callout>
+
+Three of these carry a dialect caveat:
+
+- **`drop_primary()` on MySQL costs the column its `AUTO_INCREMENT`.** MySQL refuses to drop the key an auto-increment column depends on, so the framework gives up `AUTO_INCREMENT` first (the column keeps its type, nullability and comment) and then drops the key. If the replacement key should keep generating values, re-declare the column. PostgreSQL is unaffected.
+- **`drop_unique()` on SQLite only works for a unique that was added to an existing table.** A unique declared inside `create()` becomes a table-level constraint that SQLite has no statement to drop; the migration raises rather than reporting a drop it did not make. Removing one needs a table rebuild: create a replacement table without the constraint, copy the rows across, drop the original, rename the replacement.
+- **Column comments are unavailable on MySQL.** MySQL has no standalone `COMMENT ON` — setting one requires restating the whole column definition — so `table.comment(...)` and `schema.comment(...)` raise `NotImplementedError` there. Table comments (`schema.table_comment(...)`) work on every dialect.
 
 ### Concurrent indexes
 
@@ -307,6 +319,87 @@ def up(self):
         with self.schema.table("users") as table:
             table.string("timezone", 64).default("UTC")
 ```
+
+## Data Migrations
+
+Migrations can move data, not just schema — backfilling a new column, seeding reference rows, deleting orphans. Three tiers, from structured to raw:
+
+- **`self.schema`** — DDL, through the `Blueprint` API above.
+- **`self.table(name)`** — a small, model-free gateway for simple DML.
+- **`self.execute(sql, params)`** — raw SQL for everything else.
+
+```python title="database/migrations/2026_07_30_090000_seed_default_roles.py"
+from alata.db.migrator import Migration
+
+
+class SeedDefaultRoles(Migration):
+    ROLES = [
+        {"slug": "admin", "name": "Administrator"},
+        {"slug": "editor", "name": "Editor"},
+        {"slug": "viewer", "name": "Viewer"},
+    ]
+
+    def up(self):
+        self.table("roles").insert_or_ignore(self.ROLES, unique_by=["slug"])
+
+    def down(self):
+        self.table("roles").where_in("slug", [r["slug"] for r in self.ROLES]).delete()
+```
+
+`insert_or_ignore` skips rows that already exist, so the migration applies cleanly to a database that was seeded by hand — and `down()` deletes exactly the rows `up()` claims, nothing more.
+
+<Callout type="info">
+Everything here runs on the same transport as the schema builder, so inside the migration runner every statement joins the migration's transaction: a failing migration rolls back its data changes together with its DDL and its tracking record. (On PostgreSQL — MySQL DDL auto-commits, as [above](#postgresql-first-execution).)
+</Callout>
+
+### The table gateway
+
+`self.table(name)` returns a fresh, unfiltered gateway each time you call it:
+
+| Method | What it does |
+| --- | --- |
+| `insert(rows)` | Insert one row (dict) or many (list of dicts); returns the row count |
+| `insert_or_ignore(rows, unique_by)` | Insert, silently skipping rows that already exist per the `unique_by` constraint; returns the number actually inserted on PostgreSQL/SQLite (re-run → 0) — on MySQL the count is advisory, so guard idempotency with the data, not the return |
+| `upsert(rows, unique_by, update_cols)` | Insert, updating only `update_cols` on conflict; other columns keep their existing values. Every `update_cols` entry must appear in the supplied rows, and `update_cols=[]` raises — use `insert_or_ignore` for that |
+| `where(col, value)` / `where_in(col, values)` | Chainable equality/membership filters for `update` and `delete`. `where_in` rejects a bare string with `TypeError` rather than iterating it into one character per element |
+| `update(values)` / `delete()` | Apply to the filtered rows; returns the affected count. `update` may run unfiltered (whole-table backfills are legitimate); `delete` requires at least one condition — a deliberate full-table delete goes through `execute()` |
+| `exists(**equalities)` | `True` when at least one row matches every `column=value` given — an idempotency guard for backfills. Requires at least one condition |
+
+On MySQL, `insert_or_ignore` and `upsert` compile to `ON DUPLICATE KEY UPDATE`, which fires on a violation of *any* unique index — MySQL cannot target the `unique_by` constraint specifically — and the returned counts differ for conflicting rows (the driver counts skipped duplicates too, which is why the return is advisory there).
+
+### Raw SQL
+
+`execute` runs a statement with bound parameters and returns the affected-row count (`-1` when the driver does not report one). A collection expands into one placeholder per element **only** where the statement uses it in an `IN` position, so `IN` clauses take collections directly:
+
+```python
+def up(self):
+    self.execute(
+        "UPDATE users SET plan = :plan WHERE id IN :ids",
+        {"plan": "legacy", "ids": [17, 23, 42]},
+    )
+```
+
+Anywhere else a collection binds as a single value, which is what it means there — `VALUES (:tags)` against a PostgreSQL `text[]` column binds one array. Parameters the statement never mentions are ignored whatever their type.
+
+Because `:name` marks a bind parameter, a literal colon inside a SQL string literal must be escaped as `\:`:
+
+```python
+self.execute(r"UPDATE sites SET url = 'https\://example.com' WHERE id = :id", {"id": 1})
+```
+
+`fetch_all` returns every row as a plain dict, and `fetch_one` returns the first row or `None` — same binding rules, meant for guard checks before an expensive backfill:
+
+```python
+def up(self):
+    if self.fetch_one("SELECT 1 FROM settings WHERE key = 'currency'") is None:
+        self.execute("INSERT INTO settings (key, value) VALUES ('currency', 'USD')")
+```
+
+<Callout type="warn">
+Never import application models in a migration. A migration replays against the **historical** schema — on a fresh database, years after it was written — while models always describe today's. A model-based data migration silently breaks the moment the model drifts. This is why the gateway is model-free and its surface deliberately tiny (no hydration, no joins, no ordering): every statement names exactly the columns the migration states. Anything beyond it belongs in `self.execute()`.
+</Callout>
+
+Data migrations are for one-time corrections tied to a point in schema history. Recurring reference data and development fixtures belong in [seeders](/docs/database/seeding), which run in full application context and are meant to use your models.
 
 ## Programmatic Access
 

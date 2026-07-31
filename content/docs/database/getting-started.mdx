@@ -166,6 +166,23 @@ deleted = await DB.astatement("DELETE FROM sessions WHERE expired_at < NOW()")
 Always pass user input through the `params` dict — never interpolate it into the SQL string. Bind parameters are sent to the driver separately, which is what keeps raw queries injection-safe.
 </Callout>
 
+### Raw SQL inside a transaction
+
+`select` and `statement` — sync and async, on `DB` and on any connection proxy — run on the ambient transaction's session when one is open:
+
+```python
+with DB.transaction():
+    DB.statement("UPDATE accounts SET balance = balance - :n WHERE id = :id", {"n": 50, "id": 1})
+    rows = DB.select("SELECT balance FROM accounts WHERE id = :id", {"id": 1})
+    # the read sees the write above; both roll back if the block raises
+```
+
+Outside a transaction they run on their own session and commit on their own, as before. A transaction opened on `default` never captures statements aimed at `reporting`.
+
+<Callout type="warn">
+A raw write inside a transaction block now **rolls back with it**. If you have a write meant to survive a rollback — an audit-log row recording the failed attempt, say — issue it on a separate connection (`DB.connection("audit").statement(...)`) or move it outside the block.
+</Callout>
+
 ### Fluent table access
 
 `DB.table()` returns a lightweight query builder that works on any table without a model class — handy for pivot tables, admin tooling, and migrations. It is covered in full on the [Query Builder](/docs/database/query-builder#raw-table-queries-dbtable) page:
