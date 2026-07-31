@@ -190,7 +190,7 @@ List the per-caller limit first, so a caller already over their own quota never 
 
 ## Manual rate limiting
 
-The limiter is a container singleton with nothing HTTP about it. Every method has a sync form and an `a`-prefixed async twin:
+The limiter is a container singleton with nothing HTTP about it. Every method has a sync form and an `a`-prefixed async twin — [Async and Sync](/docs/basics/async-and-sync) covers which one belongs where:
 
 ```python title="app/services/otp.py"
 from alata.container import container

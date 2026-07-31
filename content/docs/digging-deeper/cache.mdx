@@ -9,9 +9,9 @@ Alata ships a cache layer with a pluggable store behind a single facade — file
 ```python
 from alata.cache import Cache
 
-await Cache.put("greeting", "hello", ttl=300)
-value = await Cache.get("greeting")   # "hello"
-await Cache.forget("greeting")
+await Cache.aput("greeting", "hello", ttl=300)
+value = await Cache.aget("greeting")   # "hello"
+await Cache.aforget("greeting")
 ```
 
 ## Configuration
@@ -94,43 +94,43 @@ and lets every request through. Treat the WARNING as an alerting signal.
 
 ## The Cache API
 
-`Cache` stores **string values**. Every method has an async form (primary) and, for the common operations, a `_sync` twin for CLI commands and other synchronous contexts.
+`Cache` stores **string values**. Methods follow the framework-wide naming rule: the plain name (`get`, `put`, ...) is synchronous, and the `a`-prefixed twin (`aget`, `aput`, ...) is the one to `await`. The examples below run in async contexts — handlers, queue tasks — so they use the `a`-prefixed forms.
 
 ### Retrieving and storing
 
 ```python
 # Read — returns None on a miss, or your default
-value = await Cache.get("stats:daily")
-value = await Cache.get("stats:daily", default="0")
+value = await Cache.aget("stats:daily")
+value = await Cache.aget("stats:daily", default="0")
 
 # Write — ttl is in seconds; None means no expiry
-await Cache.put("stats:daily", "42", ttl=3600)
-await Cache.put("config:banner", "on")          # no expiry
+await Cache.aput("stats:daily", "42", ttl=3600)
+await Cache.aput("config:banner", "on")          # no expiry
 
 # Existence and removal
-if await Cache.has("stats:daily"):
+if await Cache.ahas("stats:daily"):
     ...
-await Cache.forget("stats:daily")
+await Cache.aforget("stats:daily")
 ```
 
 <Callout type="warn">
 A non-positive `ttl` is not "expire immediately" — the write is silently skipped. Pass `ttl=None` for a key that should live forever.
 </Callout>
 
-### Cache-aside with `remember`
+### Cache-aside with `aremember`
 
-`remember` returns the cached value if present, otherwise runs your callback, stores the result, and returns it. The callback may be sync or async:
+`aremember` returns the cached value if present, otherwise runs your callback, stores the result, and returns it. The callback may be sync or async. It is async-only — there is no sync counterpart:
 
 ```python
 async def fetch_dashboard(user_id: str) -> dict:
-    return await Cache.remember(
+    return await Cache.aremember(
         f"dashboard:{user_id}",
         ttl=300,
         callback=lambda: build_dashboard(user_id),  # sync or async
     )
 ```
 
-By default `remember` serializes with `json.dumps` and deserializes with `json.loads`, so dicts and lists round-trip transparently: you get the structured object back on both cache hits and misses. Pass your own `serializer`/`deserializer` pair for other types. A callback returning `None` is not cached.
+By default `aremember` serializes with `json.dumps` and deserializes with `json.loads`, so dicts and lists round-trip transparently: you get the structured object back on both cache hits and misses. Pass your own `serializer`/`deserializer` pair for other types. A callback returning `None` is not cached.
 
 ### Counters
 
@@ -140,7 +140,7 @@ seconds; an existing key keeps its original expiry, so increments never
 extend the window — which is what makes fixed-window counting correct.
 
 ```python
-attempts = await store.increment("login:u1", 1, ttl=60)
+attempts = await store.aincrement("login:u1", 1, ttl=60)
 ```
 
 Every driver agrees on the two edge cases:
@@ -165,10 +165,10 @@ heavy multi-process contention, prefer `redis` or `database`.
 
 ```python
 # Delete every key under a prefix (the global prefix is applied on top)
-deleted = await Cache.forget_by_prefix("dashboard:user123:")
+deleted = await Cache.aforget_by_prefix("dashboard:user123:")
 
 # Clear the whole store
-await Cache.flush()
+await Cache.aflush()
 ```
 
 Prefixes are matched **literally**. Characters that would be wildcards in the
@@ -180,34 +180,38 @@ When a global key prefix is configured, `flush` deletes only your app's prefixed
 
 ### Atomic locks
 
-`Cache.lock` acquires a distributed lock atomically (SET NX EX) and returns an **owner token**, or `None` if the lock is already held. Pass the token back to `unlock` so you only ever release your own lock — the release is an atomic compare-and-delete, immune to the race where your TTL expires and another process acquires the lock between check and delete:
+`Cache.alock` acquires a distributed lock atomically (SET NX EX) and returns an **owner token**, or `None` if the lock is already held. Pass the token back to `aunlock` so you only ever release your own lock — the release is an atomic compare-and-delete, immune to the race where your TTL expires and another process acquires the lock between check and delete:
 
 ```python
-token = await Cache.lock("reports:rebuild", ttl=60)
+token = await Cache.alock("reports:rebuild", ttl=60)
 if token is None:
     return  # someone else is doing it
 
 try:
     await rebuild_reports()
 finally:
-    await Cache.unlock("reports:rebuild", owner=token)
+    await Cache.aunlock("reports:rebuild", owner=token)
 ```
+
+Sync contexts use the plain `Cache.lock` / `Cache.unlock` pair — same semantics, same token protocol.
 
 Locks are namespaced apart from values on **every** driver — a `lock:` sub-namespace under the global prefix on Redis, a table of their own on the memory store, separate `locks/` files on the file store, and the companion `{table}_locks` table on the database store. A lock and a cache value under the same logical key are different entries that never interact: writing or forgetting the value cannot release the lock, holding the lock never shadows the value, and `flush`/`forget_by_prefix` operate on values only.
 
 The `strict_locking` config key decides what happens when Redis is unavailable: with `True` (the default) `lock` returns `None` — acquisition fails, so uncoordinated concurrent execution is impossible; with `False` it returns a synthetic token and lets the operation proceed, which suits idempotent work like scheduling mutexes.
 
-### Sync variants
+### Sync usage
 
-For code that runs outside an event loop — [console commands](/docs/digging-deeper/console), for instance — the facade exposes sync twins backed by the sync Redis client:
+For code that runs outside an event loop — [console commands](/docs/digging-deeper/console), migrations, scripts — call the plain names, backed by the sync Redis client. Drop the `a` prefix and the `await`:
 
 ```python
-value = Cache.get_sync("key")
-Cache.put_sync("key", "value", ttl=300)
-Cache.forget_sync("key")
-Cache.has_sync("key")
-Cache.forget_by_prefix_sync("dashboard:")
+value = Cache.get("key")
+Cache.put("key", "value", ttl=300)
+Cache.forget("key")
+Cache.has("key")
+Cache.forget_by_prefix("dashboard:")
 ```
+
+[Async and Sync](/docs/basics/async-and-sync) covers which variant belongs in which context.
 
 ### Named stores
 
@@ -215,7 +219,7 @@ Cache.forget_by_prefix_sync("dashboard:")
 
 ```python
 store = Cache.store("null")
-await store.put("ignored", "value")
+await store.aput("ignored", "value")
 ```
 
 ### Testing
@@ -233,7 +237,7 @@ def test_caches_dashboard():
     fake = Cache.fake_dict()
     try:
         ...
-        assert fake.get_sync("dashboard:u1") is not None
+        assert fake.get("dashboard:u1") is not None
     finally:
         Cache.restore()
 ```

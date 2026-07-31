@@ -107,7 +107,7 @@ A few things to notice:
 
 ### Async work in commands
 
-`handle()` is synchronous. When a command needs async APIs — the async query builder, the queue broker, redis — wrap the async body with `asyncio.run()`. This is exactly how the built-in `queue:*` commands work:
+`handle()` is synchronous. When a command needs async APIs — the async query builder, the queue broker, redis — wrap the async body with `asyncio.run()`. This is exactly how the built-in `queue:*` commands work (see [Async and Sync](/docs/basics/async-and-sync) for the full sync/async picture):
 
 ```python title="app/console/commands/prune_sessions.py"
 import asyncio

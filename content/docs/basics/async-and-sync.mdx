@@ -1,0 +1,180 @@
+---
+title: Async and Sync
+description: Which variant to call, and where — the event loop, the per-layer naming conventions, and the bridge between the two worlds.
+icon: ArrowLeftRight
+---
+
+Alata code runs in two worlds. Route handlers and queue tasks run on an event loop; console commands, migrations, and scripts do not. Because of that, most I/O APIs in the framework come in pairs — a sync form and an async twin. This page is the reference for which one to call in which context.
+
+## What async is
+
+One worker process serves many requests at once. The trick is `await`: when a handler awaits I/O — a query, a cache read, an outbound HTTP call — it hands control back to the event loop, which runs other handlers while the I/O is in flight. When the result arrives, the handler resumes where it left off.
+
+```python
+@router.get("/orders/{order_id}")
+async def show_order(order_id: int):
+    order = await Order.afind_or_fail(order_id)  # yields here — other requests run
+    return {"id": order.id, "status": order.status}
+```
+
+So async is about *waiting without blocking*, not about speed. An awaited query takes exactly as long as a blocking one — but while it waits, the worker serves other traffic instead of standing still. Computation gains nothing: a CPU-heavy loop runs at the same speed either way, and hogs the loop while it does.
+
+## The one rule
+
+**Never block the event loop.** Inside an async context — route handlers, queue tasks — call the async variants. The sync variants belong in synchronous contexts: console commands, migrations, scripts, and sync test helpers — [tests](/docs/testing) are `async def` by default and await the async variants directly.
+
+<Callout type="warn">
+A blocking call in a route handler does not just slow down that one request — it stalls **every** request on that worker. While a sync `Order.find(...)` waits on the database, the event loop cannot run, so nothing else on the process is served. Nothing raises; the symptom is whole-app latency under load, which makes this the most expensive mistake on this page.
+</Callout>
+
+## Naming conventions
+
+The conventions differ per layer — this table is the reference:
+
+{/* MAINTAINERS: this table is the page's core promise. Every layer follows
+    the single convention (plain = sync, `a`-prefix = async); any rename or
+    addition to the sync/async pairs in alata-core (alata/db, alata/rate_limiting,
+    alata/cache.py) must be reflected here. */}
+
+| Layer | Sync | Async |
+| --- | --- | --- |
+| [Models](/docs/database/models) & [query builder](/docs/database/query-builder) | `find`, `first`, `get`, `create`, `save`, `delete`, `count`, `paginate`, ... | `afind`, `afirst`, `aget`, `acreate`, `asave`, `adelete`, `acount`, `apaginate`, ... |
+| [Rate limiter](/docs/digging-deeper/rate-limiting) | `attempt`, `hit`, `too_many_attempts`, `available_in`, `clear` | `aattempt`, `ahit`, `atoo_many_attempts`, `aavailable_in`, `aclear` |
+| [Cache](/docs/digging-deeper/cache) | `get`, `put`, `forget`, `has`, ... | `aget`, `aput`, `aforget`, `ahas`, ... |
+
+One rule, no exceptions: the plain name is sync, and prefixing `a` gives you the twin to `await`. A few helpers exist on one side only — the cache's `aremember` has no sync counterpart — but no name ever means different things in different layers.
+
+## Where you are async
+
+### Route handlers
+
+Handlers run on the event loop, so this is async-variant territory:
+
+```python title="routes/api.py"
+from alata.http import APIRouter
+
+from app.models.order import Order
+
+router = APIRouter()
+
+
+@router.get("/orders")
+async def list_orders(page: int = 1):
+    return await Order.query().order_by("created_at", "desc").apaginate(page=page)
+```
+
+### Queue tasks
+
+[Queue tasks](/docs/digging-deeper/queues) are async functions, and workers run them on an event loop too — same rule as handlers:
+
+```python title="app/tasks/report_tasks.py"
+from bootstrap.broker import broker
+
+from app.models.report import Report
+
+
+@broker.task(task_name="reports:generate")
+async def generate_report_task(report_id: int) -> None:
+    report = await Report.afind_or_fail(report_id)
+    report.status = "done"
+    await report.asave()
+```
+
+### Model hooks
+
+[Model hooks](/docs/database/models#async-hooks) may be `async def`. Async hooks are awaited by the async persistence twins — `acreate`, `asave`, `adelete`:
+
+```python title="app/models/order.py"
+from alata.db import Model, hook
+
+
+class Order(Model):
+    __tablename__ = "orders"
+
+    @hook("saved")
+    async def index_document(self):
+        await search_client.index(self)
+```
+
+`await Order.acreate({...})` runs the hook. A sync `Order.create({...})` reaching this hook raises `AsyncHookError` instead of silently dropping the coroutine — the error names the async twin to call.
+
+## Where you are sync
+
+### Console commands
+
+A [console command](/docs/digging-deeper/console)'s `handle()` is synchronous, so sync variants are the natural fit there. When a command needs async-only APIs — the async query builder, the queue broker — bridge with `asyncio.run()`, exactly as the built-in `queue:*` commands do:
+
+```python title="app/console/commands/prune_orders.py"
+import asyncio
+
+from alata.console import Command
+
+
+class PruneOrdersCommand(Command):
+    name = "orders:prune"
+    description = "Delete cancelled orders older than 90 days"
+
+    def handle(self) -> int:
+        return asyncio.run(self.handle_async())
+
+    async def handle_async(self) -> int:
+        from app.models.order import Order
+
+        deleted = await Order.where("status", "cancelled").adelete()
+        self.info(f"Pruned {deleted} order(s).")
+        return 0
+```
+
+`asyncio.run()` starts an event loop, runs the coroutine to completion, and tears the loop down — the sync world's one door into the async world.
+
+### Migrations and scripts
+
+Migrations run synchronously; write them with the sync API. The same goes for one-off scripts and test helpers that are not themselves `async def` — use the sync variants directly, or the `asyncio.run()` bridge when only an async API exists.
+
+## One service, both sides
+
+The pairing clicks when the same concern is touched from both worlds. Here a console command precomputes a dashboard summary, and a route handler serves it:
+
+```python title="app/console/commands/warm_dashboard.py"
+import json
+
+from alata.cache import Cache
+from alata.console import Command
+
+from app.services.dashboard import build_summary
+
+
+class WarmDashboardCommand(Command):
+    name = "dashboard:warm"
+    description = "Precompute the dashboard summary"
+
+    def handle(self) -> int:
+        Cache.put("dashboard:summary", json.dumps(build_summary()), ttl=300)
+        self.info("Dashboard warmed.")
+        return 0
+```
+
+```python title="routes/api.py"
+import json
+
+from alata.cache import Cache
+from alata.http import APIRouter
+
+router = APIRouter()
+
+
+@router.get("/dashboard")
+async def dashboard():
+    cached = await Cache.aget("dashboard:summary")
+    return json.loads(cached) if cached else {"status": "warming"}
+```
+
+Same store, same key, one facade — the command uses `Cache.put` because `handle()` has no event loop, and the handler uses `await Cache.aget` because it does. The [rate limiter](/docs/digging-deeper/rate-limiting) — resolved from the container as `container.make("limiter")` — works identically: `limiter.attempt(...)` from a command, `await limiter.aattempt(...)` from a handler.
+
+## Mixing the two
+
+Three rules cover every combination:
+
+- **`asyncio.run()` never runs inside a running loop.** Calling it from a route handler or queue task raises `RuntimeError` immediately. It is the bridge *from* sync *into* async — inside async code, just `await`.
+- **A sync twin inside async code raises nothing.** It simply blocks the worker, which is [the one rule](#the-one-rule) broken silently. This is why the naming table matters: reaching for `first` where you needed `afirst` type-checks fine and works in light testing.
+- **An async-only dependency in a sync context is the command bridge.** Split the work into `handle()` / `handle_async()` as above; the pattern scales from one call to a whole command body.

@@ -1,5 +1,5 @@
 {
   "title": "The Basics",
   "icon": "BookOpen",
-  "pages": ["routing", "requests", "middleware", "error-handling", "logging"]
+  "pages": ["routing", "requests", "middleware", "async-and-sync", "error-handling", "logging"]
 }
