@@ -177,6 +177,16 @@ with self.schema.create("posts") as table:
 | `timestamps()` | `created_at` + `updated_at` (both `TIMESTAMPTZ`, nullable) |
 | `soft_deletes()` | `deleted_at` (`TIMESTAMPTZ`, nullable) |
 
+<Callout type="info">
+`json()` maps to the dialect's *parsed* JSON type — `JSONB` on PostgreSQL, native
+`JSON` on MySQL — so the stored value is decoded and queryable the same way
+everywhere: text searches see real characters (not `\uXXXX` escapes), and
+PostgreSQL gains GIN indexing and containment (`@>`) queries. The trade-off is
+jsonb semantics: object key order is not preserved and duplicate keys collapse.
+If you need PostgreSQL's raw text-preserving `json` type, create the column with
+`self.execute()` in a migration.
+</Callout>
+
 ### Column modifiers
 
 Each column method returns a definition you can keep chaining:
