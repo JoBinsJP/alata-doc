@@ -184,9 +184,64 @@ The console can generate and register a provider in one step:
 
 This creates `app/providers/payment_provider.py` from a stub and appends `"app.providers.payment_provider"` to the `PROVIDERS` list in `bootstrap/providers.py`. If the file or the entry already exists, the command tells you and leaves things alone.
 
+## Deferred providers
+
+Boot should be cheap: `register()` binds closures, and nothing connects until something resolves the binding. A console command then touches only what it uses — `db:seed` resolves the database and nothing else, so an outage elsewhere cannot block it.
+
+For an expensive client (an SDK that does I/O on import, a connection pool, a large model), make that laziness structural. A deferred provider is not instantiated at boot; it loads the first time one of its bindings is resolved:
+
+```python title="app/providers/search_client_provider.py"
+class Provider(ServiceProvider):
+    defer = True
+    provides = ["search_client"]
+
+    def register(self) -> None:
+        self.app.singleton("search_client", self._build_client)
+```
+
+The first `container.make("search_client")` runs `register()` (under the same Phase-1 rules as boot) then `boot()`, then resolves. Loading happens once, is safe under concurrent first resolves, and the loaded provider joins the normal `shutdown()` order.
+
+The load is synchronous and holds the container's resolve lock, so keep it cheap — or, in a serving process, warm it before readiness from an eager provider's `async_boot()`: `await asyncio.to_thread(container.make, "search_client")`. Otherwise the first request that needs the client stalls that worker's event loop for every concurrent request.
+
+### What a deferred provider may not do
+
+Deferral is for expensive optional clients, not for infrastructure the whole process needs. A deferred provider **may not**:
+
+| Restriction | Why |
+|---|---|
+| Register console commands | `./alata list` runs before anything resolves — the commands would be invisible |
+| Subscribe event listeners | A provider that never loads never subscribes |
+| Override `async_boot()` or `boot_http()` | Those phases have already passed at lazy-load time |
+| Declare `defer = True` with empty `provides` | Nothing could ever trigger the load |
+
+Each raises at boot, naming the provider — except listener subscription, which nothing can detect statically; that one is a convention you own.
+
+### Async services and deferral
+
+Deferred load is synchronous, and that covers almost every async client: `redis.asyncio.Redis(...)`, `create_async_engine(...)`, `httpx.AsyncClient(...)` all construct without a loop and connect on first `await`.
+
+The rare service whose *startup itself* is a coroutine initializes on first await instead. `alata.support.async_startup.AsyncStartup` packages the race-free version:
+
+```python
+from alata.support.async_startup import AsyncStartup
+
+
+class SearchClient(AsyncStartup):
+    async def _startup(self) -> None:
+        await self._pool.connect()
+
+    async def query(self, text: str):
+        await self._ensure_started()   # runs _startup() exactly once
+        ...
+```
+
+<Callout type="info">
+Deferral trades boot-time failure for first-use failure: a misconfigured client surfaces on the first request that resolves it. Point the readiness probe at an endpoint that resolves the bindings your deployment depends on.
+</Callout>
+
 ## Built-in providers
 
-The kernel hardcodes two base providers — logging and database — that load in every boot profile. The rest ship in the scaffold's `FRAMEWORK_PROVIDERS` list, so you can reorder or remove them (carefully — order is significant, e.g. cache wraps the redis clients).
+The class-based kernel boots configuration and logging for every application without them being listed anywhere; a scaffolded project wires `DatabaseProvider` explicitly in `bootstrap/application.py`, ahead of everything else. The rest ship in the scaffold's `FRAMEWORK_PROVIDERS` list, so you can reorder or remove them (carefully — order is significant, e.g. cache wraps the redis clients).
 
 | Provider | Import | What it binds / does |
 | --- | --- | --- |
