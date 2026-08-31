@@ -71,7 +71,7 @@ That makes a disk handle safe to hold across `await` points, to stash on an obje
 `Storage` (the manager, not the facade) also accepts driver **classes** through `add_driver("name", DriverClass)` when you register your own driver; a driver instance is still accepted and used as a prototype, cloned per disk. Custom drivers should accept `(application, options)` in their constructor — the older `set_options(options)` setter also still works.
 
 <Callout type="warn">
-All storage operations are **synchronous** — they block while reading, writing, or talking to S3. In an async request handler, run them in a worker thread (for example `await anyio.to_thread.run_sync(lambda: Storage.disk("s3").put(key, data))`), or do file work in [queued jobs](/docs/digging-deeper/queues), where blocking is fine.
+The plain storage methods are **synchronous** — they block while reading, writing, or talking to S3. In async code, use the `a`-prefixed twins ([Async usage](#async-usage)): `await Storage.disk("s3").aput(key, data)`. Blocking calls belong in [queued jobs](/docs/digging-deeper/queues) or other sync contexts.
 </Callout>
 
 ## Driver API
@@ -146,6 +146,18 @@ from alata.utils.filesystem import mime_type
 kind = mime_type(disk.get_bytes("uploads/file.bin"))  # e.g. "image/png"
 ```
 
+## Async usage
+
+Every I/O method has an `a`-prefixed async twin — `aget`, `aget_bytes`, `aput`, `aexists`, `adelete`, `acopy`, `amove`, `astore`, `aget_files`, and the rest — following the framework-wide convention: plain name is sync, prefix `a` to await.
+
+```python
+content = await disk.aget_bytes("reports/2026/summary.pdf")
+```
+
+The twins offload the synchronous driver call to a worker thread, so a download inside an async route never stalls the event loop. Calling the *sync* method from async code does — a multi-megabyte `get_bytes()` freezes every task on that worker until the transfer finishes. In async code, always use the twin.
+
+A custom driver gets the async surface for free by implementing the sync methods and mixing in `alata.storage.async_ops.AsyncStorageOps`.
+
 ## The local driver
 
 The `file` driver stores files under the disk's `path`, resolved relative to the process working directory — the project root under the `./alata` and uvicorn conventions. The scaffolded disk points at `storage/app`, so:
@@ -199,7 +211,7 @@ The `s3` driver builds its boto3 client lazily, on first use, from the disk's ow
 | `endpoint` | Optional endpoint URL — point it at MinIO, LocalStack, or another S3-compatible store. |
 | `use_path_style` | Use path-style addressing instead of virtual-hosted (required by many S3-compatible stores). |
 
-Because credentials live per disk, two disks can target different buckets, regions, or even different accounts. Each disk builds and caches its own session, and the cache is keyed by the connection options it was built from — credentials, region, endpoint and addressing style — so changing any of them discards the cached session rather than reusing one built for a different account. `boto3` is an optional dependency — the driver raises a clear `ModuleNotFoundError` telling you to install it if it's missing.
+Because credentials live per disk, two disks can target different buckets, regions, or even different accounts. Each disk caches its session **per thread** — boto3 sessions are not thread-safe, and the async twins run driver calls on worker threads — keyed by the connection options it was built from (credentials, region, endpoint, addressing style), so changing any of them discards the cached session rather than reusing one built for a different account. `boto3` is an optional dependency — the driver raises a clear `ModuleNotFoundError` telling you to install it if it's missing.
 
 <Callout type="info">
 S3 "not found" responses (404 / NoSuchKey) are translated to the same conventions as the local driver — `get` and `get_bytes` return `None`, `exists` returns `False`. Any other AWS error propagates as an exception.
