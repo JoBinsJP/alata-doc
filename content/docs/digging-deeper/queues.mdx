@@ -11,9 +11,8 @@ Slow work — sending email, generating reports, ingesting files — does not be
 The queue is wired through the same application kernel as everything else:
 
 - `QueueProvider` registers the broker as a lazy singleton in the [service container](/docs/architecture/container) under the key `queue.broker`.
-- The broker factory (`alata.queue.broker.build_broker`) reads the `queue` config namespace and builds either a Redis broker or an SQS broker, then attaches the framework's `RetryMiddleware` and `BatchMiddleware`.
+- Select the queue connection and retry settings in `config/queue.py`.
 - Your project's `bootstrap/broker.py` exposes the public `broker` symbol. Importing it boots the full application, so a worker that loads it gets initialized database engines and every other registered service — no worker-specific bootstrap code.
-- The broker takes part in the [application lifecycle](/docs/architecture/lifecycle). On shutdown `QueueProvider` closes it — releasing the Redis connection pools it owns — and, on the in-process broker, first waits for already-accepted jobs to finish (bounded, so teardown can never hang). A broker that was never resolved is never built just to be torn down.
 
 ```python title="bootstrap/broker.py (scaffolded)"
 from bootstrap.application import app
@@ -194,15 +193,13 @@ print(result.return_value)
 `is_result_ready()` is `False` until the job has finished and `True` afterwards; a failed job stores `is_err=True` with a description of the exception, so `raise_for_error()` raises.
 
 <Callout type="warn">
-**Results always expire.** `result_ttl` (default `86400` — 24 hours) is applied to every result written; there is no "keep forever" setting. A results table that only grows is an outage with a long fuse. Raise `result_ttl` if you collect results later than a day after dispatch, and remember that a result older than the TTL reads exactly like a task that has not finished yet.
+Results expire after `result_ttl` seconds (default `86400` — 24 hours). Raise it if you collect results later than a day after dispatch. An expired result reads like a task that has not finished yet.
 </Callout>
-
-Expiry is enforced on both sides. Reads treat an expired row as absent, so the answer never depends on whether a cleanup has run. Writes prune: a `set_result` may also delete every expired row — one indexed `DELETE`, at most once every few minutes per process — so the sweep rides on work that is already happening instead of a background task you have to supervise.
 
 Results are stored as a JSON document holding the return value, `is_err`, `execution_time`, `labels`, and the error. Two limits are worth knowing:
 
-- **The return value must be JSON-compatible.** A value that will not serialize does not take the worker down: the value is dropped, an error result naming the offending type is stored instead, and a warning is logged. The caller sees a failure rather than waiting out its timeout for a result that was never written. Return ids and re-fetch, exactly as you would for a job payload.
-- **Tracebacks do not survive.** An error comes back as its type, module and arguments — enough to rebuild the original exception class when it is importable, and a stand-in with the same name and message when it is not. `__cause__` and `__context__` come back too. For the line it failed on, read the worker's logs.
+- **Return JSON-compatible values.** A value that cannot be serialized produces an error result. Prefer IDs that the caller can use to fetch the data.
+- **Read worker logs for tracebacks.** Stored errors include the exception type and message, but not the worker's traceback.
 
 ### The Redis connection
 

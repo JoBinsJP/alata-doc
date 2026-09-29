@@ -4,9 +4,9 @@ description: Configure database connections and run queries with Alata's SQLAlch
 icon: Database
 ---
 
-Alata's database layer is built directly on SQLAlchemy 2.0 — including its async engine — and that is a deliberate design choice, not an implementation detail. You get a fluent, expressive API on top, and the most battle-tested SQL toolkit in Python underneath: real connection pooling, dialect-aware SQL compilation, and first-class asyncio support. Nothing is reinvented; everything is composable.
+Alata provides sync and async database queries through its fluent query builder and models. You can also use SQLAlchemy 2.0 directly for queries the builder does not cover.
 
-The layer has four parts, each with its own page:
+The database guides cover:
 
 <Cards>
   <Card title="Query Builder" href="/docs/database/query-builder" description="Fluent, chainable queries with sync and async execution." />
@@ -18,7 +18,7 @@ This page covers the foundation the others stand on: connections, the `DB` facad
 
 ## Configuration
 
-Database configuration lives in `config/database.py`. The file is purely declarative — it defines a `CONNECTIONS` dictionary keyed by connection name, and the framework's database provider builds the actual engines from it during boot:
+Define your connections in the `CONNECTIONS` dictionary in `config/database.py`, keyed by connection name:
 
 ```python title="config/database.py"
 from config.settings import settings
@@ -95,7 +95,7 @@ Usernames and passwords are URL-encoded automatically, so credentials containing
 
 ### Sync and async engines
 
-Every named connection gets **both** a sync engine and an async engine, each with its own session factory. The async engine serves your HTTP endpoints through the `a`-prefixed query API; the sync engine serves the CLI, migrations, and workers. Both are initialized once at boot and shared for the life of the process.
+Every named connection supports both sync and async queries. Use the `a`-prefixed API in async code, such as HTTP handlers, and the sync API in synchronous code, such as console commands.
 
 Pool tuning keys (`pool_size`, `max_overflow`, `pool_pre_ping`, `pool_recycle`, `echo`) are passed straight through to SQLAlchemy's engine factory, so you can tune each connection independently.
 
@@ -199,7 +199,7 @@ Everything above also exists on the connection proxy, scoped to that connection:
 
 ### Context-managed transactions
 
-The simplest way to run work atomically is the transaction context manager. It commits on success and rolls back on any exception:
+The simplest way to run work atomically is the transaction context manager. It commits on success and rolls back on an exception:
 
 ```python
 from alata.db import DB
@@ -217,11 +217,13 @@ async with DB.atransaction():
     await AuditLog.acreate({"action": "transfer", "amount": amount})
 ```
 
-While a transaction is open, every query in the same context that targets that connection automatically runs on the transaction's session — you don't pass the session around.
+Queries on the same connection participate in the transaction. Use sync queries inside `DB.transaction()` and async queries inside `DB.atransaction()`.
+
+Keep related operations in the same task and thread. Await them directly inside `DB.atransaction()`; work dispatched through `asyncio.create_task()`, `asyncio.gather()`, or `asyncio.to_thread()` runs outside that transaction.
 
 ### Nesting
 
-Transactions nest. An inner `DB.transaction()` opens a **savepoint** on the outer session, so the outer transaction stays atomic: if the inner block raises, only the savepoint rolls back; if the outer block raises, everything does.
+Both `DB.transaction()` and `DB.atransaction()` support nesting through **savepoints**: if an inner block raises, only its work rolls back; if the outer block raises, everything does.
 
 ```python
 with DB.transaction():
@@ -233,16 +235,14 @@ with DB.transaction():
         pass                            # inner work undone, order.save() intact
 ```
 
-### Per-connection transaction stacks
+### Transactions on named connections
 
-Transaction state is tracked in a per-context stack **keyed by connection name**. A transaction opened on `default` never captures queries that target `reporting`, and vice versa. To run a transaction on a named connection, scope it:
+A transaction applies only to its selected connection. To run a transaction on a named connection, scope it:
 
 ```python
 with DB.connection("reporting").transaction():
     Report.create({...})
 ```
-
-Because the stacks live in context-local storage, concurrent requests and tasks each get their own independent transaction state.
 
 ### Manual transactions
 
@@ -253,7 +253,7 @@ DB.begin_transaction()
 try:
     ...
     DB.commit()
-except Exception:
+except BaseException:
     DB.rollback()
     raise
 ```
@@ -265,20 +265,20 @@ await DB.abegin_transaction()
 try:
     ...
     await DB.acommit()
-except Exception:
+except BaseException:
     await DB.arollback()
     raise
 ```
 
 <Callout type="info">
-`commit()` and `rollback()` fully release the transaction level opened by `begin_transaction()` — the session is popped from the stack and its connection returned to the pool. They are no-ops if no manual transaction is open. The same methods exist per connection via `DB.connection("name").begin_transaction()` and friends.
+`commit()` and `rollback()` end the transaction level opened by `begin_transaction()`. The same methods are available on named connections through `DB.connection("name")`.
 </Callout>
 
 ## Beyond the builder: SQLAlchemy access
 
-Because the whole layer is SQLAlchemy 2.0 underneath, you can always drop one level down without leaving the framework — same engines, same pools, same transaction state. This is the sanctioned path for queries the fluent API cannot express.
+Because the whole layer is SQLAlchemy 2.0 underneath, you can always drop one level down and use the framework's engines and pools. This is the sanctioned path for queries the fluent API cannot express.
 
-`get_session()` and `get_async_session()` hand you a plain SQLAlchemy session bound to any named connection:
+`get_session()` and `get_async_session()` create a new plain SQLAlchemy session bound to a named connection. They do not join an ambient `DB` transaction; use the session yielded by its context manager when work must share that transaction:
 
 ```python
 import sqlalchemy as sa
@@ -328,7 +328,9 @@ DB.pool_status_all()         # every registered connection
 
 `pool_status()` returns a dict with `pool_size`, `max_overflow`, `checked_out`, `checked_in`, `overflow`, `total_connections`, `max_capacity`, and `utilization_pct`.
 
-The framework also installs pool event listeners at boot: you get a WARNING log when a pool passes 80% utilization and an ERROR when it is fully exhausted. If a checkout times out because the pool is drained, the raw driver error is wrapped in a `ConnectionPoolExhaustedError` whose message includes the live metrics and points you at the `pool_size` / `max_overflow` knobs in `config/database.py`.
+`checked_in` counts idle connections and `checked_out` counts connections in use; `total_connections` is their sum. `overflow` counts connections beyond `pool_size`. For bounded pools, `max_capacity` is `pool_size + max_overflow`, and `utilization_pct` is the percentage of that capacity currently in use.
+
+Pool utilization produces a WARNING log at 80% and an ERROR at full capacity. If acquiring a connection times out, inspect the live metrics and review `pool_size` / `max_overflow` in `config/database.py`, along with how long your application holds connections.
 
 ### The db:status command
 
@@ -352,10 +354,6 @@ It boots only the database layer (fast — no app providers) and renders each co
     ├─ Overflow      0
     └─ Total Active  5
 ```
-
-## Graceful shutdown
-
-You never dispose engines yourself. During application shutdown the database provider calls `dispose_engines()`, which drains and disposes every registered engine — async first, then sync — and clears the registries. Pools are emptied cleanly instead of dropping connections mid-flight, and a failure to dispose one engine never aborts the shutdown of the rest.
 
 ## Next steps
 

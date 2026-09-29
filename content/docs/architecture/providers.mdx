@@ -8,7 +8,7 @@ Service providers are the units of bootstrapping in Alata. Each provider binds i
 
 ## Anatomy of a provider
 
-A provider subclasses `ServiceProvider` and overrides only the hooks it needs. Base-class no-ops are detected and skipped automatically, so an empty hook costs nothing — no call, no log line.
+A provider subclasses `ServiceProvider` and overrides only the hooks it needs.
 
 ```python title="app/providers/http_client_provider.py"
 import httpx
@@ -18,11 +18,18 @@ from alata.support.service_provider import ServiceProvider
 
 class HttpClientProvider(ServiceProvider):
     def register(self) -> None:
-        client = httpx.AsyncClient(timeout=10.0)
-        self.app.singleton("http_client", lambda: client)
+        self._client = httpx.AsyncClient(timeout=10.0)
+        self.app.instance("http_client", self._client)
+
+    async def async_boot(self) -> None:
+        if self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=10.0)
+            self.app.instance("http_client", self._client)
 
     async def shutdown(self) -> None:
-        await self.app.make("http_client").aclose()
+        client = getattr(self, "_client", None)
+        if client is not None and not client.is_closed:
+            await client.aclose()
 ```
 
 Every provider is constructed with the application kernel, available as `self.app` — which is also the container, so `self.app.singleton(...)`, `self.app.make(...)`, and friends all work directly. An optional second constructor argument lands on `self.config`.
@@ -112,8 +119,12 @@ Async graceful teardown, called from the lifespan on server shutdown — in **re
 
 ```python
 async def shutdown(self) -> None:
-    await self.app.make("http_client").aclose()
+    client = getattr(self, "_client", None)
+    if client is not None and not client.is_closed:
+        await client.aclose()
 ```
+
+For resources your provider owns, make cleanup safe after incomplete startup or repeated shutdown. Prepare them again in `async_boot()` if the application starts another lifespan, as in the HTTP client example above.
 
 ### `commands()`
 
@@ -246,8 +257,8 @@ The class-based kernel boots configuration and logging for every application wit
 | Provider | Import | What it binds / does |
 | --- | --- | --- |
 | Log | `alata.providers.log_provider` | Binds the `"log"` manager (with `LogManager` type-mapped for `@inject`) and configures the root logger; always loads first. |
-| Database | `alata.providers.database_provider` | Initializes sync + async database engines from `database.connections`, binds `"engine"` and `"migrator"`, registers the `migrate` command family, disposes pools on shutdown. |
-| Redis | `alata.providers.redis_provider` | Binds one `"redis.<name>"` (and `"redis.<name>.async"`) singleton per configured connection, deduplicating connections that share a URL; closes resolved clients on shutdown. |
+| Database | `alata.providers.database_provider` | Configures database connections, binds `"engine"` and `"migrator"`, and registers database commands. |
+| Redis | `alata.providers.redis_provider` | Binds `"redis.<name>"` and `"redis.<name>.async"` clients for each configured connection. |
 | Events | `alata.providers.event_provider` | Binds the `"events"` dispatcher singleton for event → listener mappings. |
 | Queue | `alata.providers.queue_provider` | Binds the `"queue.broker"` singleton — the broker workers and task definitions resolve. |
 | Cache | `alata.providers.cache_provider` | Binds `"cache"` (redis-backed store, falling back to a null store when Redis is unavailable) and `"cache.null"`. |
