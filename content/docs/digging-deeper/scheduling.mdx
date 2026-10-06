@@ -50,7 +50,7 @@ schedule.command("db:status").hourly().append_output_to("storage/logs/db.log")
 
 ### Queued jobs
 
-`schedule.job()` dispatches a registered queue task to the broker — the scheduler only pushes the message; a [queue worker](/docs/digging-deeper/queues) does the actual work:
+`schedule.job()` dispatches a registered queue task to the broker — a [queue worker](/docs/digging-deeper/queues) executes it when using the database, Redis, or SQS connection. The `sync` connection runs the job inline:
 
 ```python
 schedule.job("reports:generate").daily_at("02:00")
@@ -62,7 +62,7 @@ schedule.job("reports:generate", user_id="abc", queue="reports").hourly()
 schedule.job("emails:digest").daily().on_queue("emails")
 ```
 
-The task name must match a task registered on the broker; if it cannot be found, the event fails and logs an error rather than crashing the scheduler.
+The task must be registered on the scheduler's broker. Import its task module in `schedule()` before calling `schedule.job()`; worker task discovery does not run in the scheduler process. An unknown task fails the event and is logged.
 
 ### Callables
 
@@ -237,7 +237,7 @@ The lock key is scoped to the current minute (with a TTL just over one cron cycl
 The claim is taken **once per minute per event**, not once per execution — so a sub-minute event that wins the claim keeps running for the rest of that minute instead of losing to its own lock on the second repeat.
 
 <Callout type="warn">
-Both `without_overlapping()` and `on_one_server()` are backed by the configured cache store — Redis by default. All servers must point at the **same** cache for the locks to mean anything.
+Both `without_overlapping()` and `on_one_server()` are backed by the configured cache store — the scaffold defaults to a local file store. For coordination across servers, select Redis or the database store and point every server at the **same** backend.
 </Callout>
 
 ## Hooks
@@ -292,8 +292,8 @@ schedule.command("report:send").cron("@daily").mondays()   # 0 0 * * 1
 
   Expression   Description                    Next Due (UTC)    Constraints
   -----------  -----------------------------  ----------------  -----------
-  0 * * * *    ./alata queue:prune-orphans    2026-07-28 15:00  -
-  0 2 * * *    Job: reports:generate          2026-07-29 02:00  one-server
+  0 * * * *    ./alata queue:prune-orphans    2026-07-28 15:00  tz:UTC
+  0 2 * * *    Job: reports:generate          2026-07-29 02:00  one-server, tz:UTC
 ```
 
 The constraints column flags `no-overlap`, `one-server`, and `tz:<zone>` so you can verify locking and timezone behavior at a glance.

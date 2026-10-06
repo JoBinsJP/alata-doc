@@ -4,7 +4,7 @@ description: Run Alata in production — ASGI server, queue workers, the schedul
 icon: Server
 ---
 
-An Alata deployment is three long-running processes — the ASGI server, one or more queue workers, and a cron-driven scheduler — all loading the **same application kernel**. This page covers how to start each one, how to pin the framework version, and how the framework behaves once the environment is `production`.
+A typical Alata deployment runs an ASGI server, queue workers, and a cron-driven scheduler, each booting the same application configuration in its own process. This page covers how to start each one, how to pin the framework version, and how the framework behaves once the environment is `production`.
 
 ## One kernel, every process
 
@@ -16,7 +16,7 @@ An Alata deployment is three long-running processes — the ASGI server, one or 
 | Console | `./alata <command>` | `bootstrap/application.py` directly |
 | Queue worker | `taskiq worker bootstrap.broker:broker` | `bootstrap/broker.py` → `broker = app.make("queue.broker")` |
 
-Because the worker's `bootstrap/broker.py` imports the application, a taskiq worker starts with the full provider lifecycle already run — initialized database engines, redis clients, and every service you registered — with **no worker-specific boot code**. HTTP, console, and workers never run on different containers.
+Importing `bootstrap/broker.py` runs the kernel's synchronous provider registration and boot hooks. Each process gets its own container. Async provider hooks require the application lifespan; importing the broker alone does not run them.
 
 ## The ASGI server
 
@@ -54,7 +54,7 @@ Start a worker with the console command:
 ./alata queue:work --queue high,default --workers 4
 ```
 
-`--queue` takes a comma-separated priority list (leftmost is highest). Under the hood this runs the taskiq CLI, which you can invoke directly in a container entrypoint or process manager:
+`--queue` overrides the configured queue. Redis and database workers accept a comma-separated priority list (leftmost is highest); SQS accepts one queue. See [queue worker configuration](/docs/digging-deeper/queues#running-workers). Under the hood this runs the taskiq CLI, which you can invoke directly in a container entrypoint or process manager:
 
 ```bash
 python -m taskiq worker bootstrap.broker:broker \
@@ -86,7 +86,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-alata = { git = "ssh://git@github.com/JoBinsJP/alata-core.git", tag = "v0.11.0.0" }
+alata = { git = "ssh://git@github.com/JoBinsJP/alata-core.git", tag = "v0.11.0.1" }
 ```
 
 Then `uv sync` in your build step produces the same framework version every time. Upgrading is a one-line tag bump. The repository is private — your build environment needs SSH access to it.

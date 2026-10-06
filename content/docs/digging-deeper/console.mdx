@@ -38,7 +38,8 @@ The framework registers this command set out of the box:
 | `migrate` | Run all pending database migrations. |
 | `migrate:rollback` | Roll back the last batch of migrations. |
 | `migrate:fresh` | Drop all tables and re-run every migration from scratch. |
-| `migrate:sync` | Mark all existing migrations as run without executing SQL. |
+| `migrate:sync` | Record existing migrations as applied without running their `up()` methods. |
+| `migrate:publish` | Copy framework infrastructure migrations (`--only`, `--dry-run`, `--force`). |
 | `migrate:status` | Show the status of all migrations. |
 | `make:migration <name>` | Generate a new migration file. |
 | `make:seeder <name>` | Generate a new database seeder class. |
@@ -60,7 +61,7 @@ The `queue:*` family is covered in depth on the [queues page](/docs/digging-deep
 
 ### Maintenance mode
 
-`./alata down` creates a flag file at `storage/framework/down`. While it exists, the maintenance-mode [middleware](/docs/basics/middleware) returns `503` for every request and the scheduler skips due events (unless an event is marked `even_in_maintenance_mode()`). `./alata up` removes the flag. Both commands are idempotent — running them twice just prints a notice.
+`./alata down` creates a flag file at `storage/framework/down`. While it exists, the maintenance-mode [middleware](/docs/basics/middleware) returns `503` except for configured bypass paths and the scheduler skips due events (unless an event is marked `even_in_maintenance_mode()`). `./alata up` removes the flag. Both commands are idempotent — running them twice just prints a notice.
 
 ## Writing commands
 
@@ -183,13 +184,15 @@ class ProjectQueueWorkCommand(QueueWorkCommand):
     _queue_default = "emails"
 ```
 
-## The `--config` option
+## Choosing an environment
 
-Framework commands also carry a shared `-C/--config` option that points database-aware commands at an alternative database configuration file. When it is not given, the `DB_CONFIG_PATH` environment variable is consulted, and finally the standard `config.database` module from your [configuration](/docs/getting-started/configuration).
+Select an environment-specific configuration file with the global `--env` flag:
 
 ```bash
-./alata migrate --config=config/analytics_database.py
+./alata migrate --env testing
 ```
+
+This loads `.env` followed by `.env.testing`. Configure database connection values in that overlay, as described in [configuration](/docs/getting-started/configuration#env-files-and-environment-detection).
 
 ## Generator commands
 

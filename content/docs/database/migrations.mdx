@@ -4,7 +4,7 @@ description: Version your database schema with migration files, a fluent schema 
 icon: Table
 ---
 
-Migrations are version control for your database schema. Each migration is a small Python file that knows how to apply a change (`up`) and how to revert it (`down`). Alata tracks which migrations have run, applies pending ones in order, and can roll back the last batch — safely, even when several deploy processes race each other.
+Migrations are version control for your database schema. Each migration is a small Python file that knows how to apply a change (`up`) and how to revert it (`down`). Alata tracks which migrations have run, applies pending ones in order, and can roll back the last batch — with PostgreSQL advisory locking to coordinate concurrent deploys.
 
 ## Generating Migrations
 
@@ -85,8 +85,9 @@ Runs every pending migration, in filename order, as a new **batch**. The other c
 | `./alata migrate` | Run all pending migrations |
 | `./alata migrate:rollback` | Revert the last batch (calls each migration's `down()` in reverse order) |
 | `./alata migrate:status` | Show every migration with its ran/pending state and batch number |
-| `./alata migrate:fresh` | Drop everything (runs every `down()` in reverse, then drops the tracking table) and re-run all migrations from scratch |
-| `./alata migrate:sync` | Mark all discovered migrations as run **without executing any SQL** |
+| `./alata migrate:fresh` | Revert applied migrations, drop the tracking table, and run all migrations again |
+| `./alata migrate:sync` | Record discovered migrations as applied without executing their `up()` methods |
+| `./alata migrate:publish` | Copy framework infrastructure migrations into the application |
 | `./alata make:migration <name>` | Generate a new migration file |
 
 <Callout type="warn">
@@ -95,17 +96,30 @@ Runs every pending migration, in filename order, as a new **batch**. The other c
 
 #### What `migrate:fresh` guarantees
 
-The whole operation — teardown and re-run — happens under the migration lock, so a concurrent deploy cannot migrate into a database that is being torn down.
+On PostgreSQL, teardown and re-run hold the migration lock. Run migration commands one at a time on MySQL and SQLite, where Alata does not acquire this advisory lock.
 
 Only migrations the tracking table records as **applied** are reverted. A pending migration never ran, so there is nothing for its `down()` to undo — and an ALTER-style `down()` against a table that does not exist would abort the whole teardown.
 
-The order is deliberate: those `down()` methods run first, in reverse, and the **tracking table is dropped last**. Each reverted migration has its tracking row deleted as it goes, so the table always describes what is actually in the database. A `down()` that fails aborts the command with the failing migrations named and leaves the tracking table intact — the database still matches its own migration history, so `migrate:rollback` still works and nothing is orphaned. Drop failures are never swallowed: re-running migrations over surviving tables would quietly produce a schema that doesn't match its migrations.
+The order is deliberate: those `down()` methods run first, in reverse, and the **tracking table is dropped last**. Each successfully reverted migration has its tracking row deleted. If `down()` fails, the command stops and retains the remaining tracking records. On databases without transactional DDL, inspect any partial schema changes before retrying.
 
 If a `down()` fails, fix it (or drop the objects by hand) and run `migrate:fresh` again.
 
 <Callout type="info">
 `migrate:sync` is the adoption path: if your tables already exist (created by hand or by a previous tool), run it once so the tracking table matches reality and `migrate` reports nothing to do.
 </Callout>
+
+### Publishing framework migrations
+
+New projects already include the framework tables. When enabling database caching or queues in an existing application, publish the missing migrations first:
+
+```bash
+./alata migrate:publish --dry-run
+./alata migrate:publish --only=cache
+./alata migrate:publish --only=jobs
+./alata migrate
+```
+
+Omit `--only` to publish all infrastructure migrations. Existing files or migrations creating the same tables are skipped; review before using `--force` to override that protection.
 
 ### The tracking table
 
@@ -387,10 +401,10 @@ class SeedDefaultRoles(Migration):
         self.table("roles").insert_or_ignore(self.ROLES, unique_by=["slug"])
 
     def down(self):
-        self.table("roles").where_in("slug", [r["slug"] for r in self.ROLES]).delete()
+        raise RuntimeError("Reference roles must be removed in a separate migration.")
 ```
 
-`insert_or_ignore` skips rows that already exist, so the migration applies cleanly to a database that was seeded by hand — and `down()` deletes exactly the rows `up()` claims, nothing more.
+This example requires a unique index on `roles.slug` and preserves existing roles. It is intentionally irreversible: those roles may predate the migration or already be assigned to users. Its `down()` stops rollback and `migrate:fresh`; remove roles through a separate migration that handles their assignments. For reversible data migrations, undo only changes the migration owns.
 
 <Callout type="info">
 Everything here runs on the same transport as the schema builder, so inside the migration runner every statement joins the migration's transaction: a failing migration rolls back its data changes together with its DDL and its tracking record. (On PostgreSQL — MySQL DDL auto-commits, as [above](#postgresql-first-execution).)

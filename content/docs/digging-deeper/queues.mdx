@@ -1,6 +1,6 @@
 ---
 title: Queues
-description: Dispatch background jobs to Redis or SQS workers, with retries, batches, and failed-job tooling built in.
+description: Dispatch background jobs to database, Redis, or SQS workers, with retries, batches, and failed-job tooling built in.
 icon: Zap
 ---
 
@@ -12,7 +12,7 @@ The queue is wired through the same application kernel as everything else:
 
 - `QueueProvider` registers the broker as a lazy singleton in the [service container](/docs/architecture/container) under the key `queue.broker`.
 - Select the queue connection and retry settings in `config/queue.py`.
-- Your project's `bootstrap/broker.py` exposes the public `broker` symbol. Importing it boots the full application, so a worker that loads it gets initialized database engines and every other registered service — no worker-specific bootstrap code.
+- Your project's `bootstrap/broker.py` exposes the public `broker` symbol. Importing it runs provider registration and synchronous boot hooks, including database setup. See [deployment](/docs/getting-started/deployment#one-kernel-every-process) for the provider lifecycle in each process.
 
 ```python title="bootstrap/broker.py (scaffolded)"
 from bootstrap.application import app
@@ -22,7 +22,7 @@ broker = app.make("queue.broker")
 
 ```mermaid
 graph LR
-    A["app code<br/>task.kiq(...)"] -->|serialized message| B[("Redis list / SQS queue")]
+    A["app code<br/>task.kiq(...)"] -->|serialized message| B[("Database / Redis / SQS")]
     B --> C["worker process<br/>./alata queue:work"]
     C --> D["RetryMiddleware"]
     C --> E["BatchMiddleware"]
@@ -31,14 +31,16 @@ graph LR
 ```
 
 <Callout type="info">
-Keep job payloads small — pass IDs, not objects. Workers share the application kernel, so they can fetch the heavy data from the database. Small payloads also stay safely under SQS's 256&nbsp;KB message limit.
+Keep job payloads small — pass IDs, not objects. Workers boot the same application configuration and can fetch the data from the database. Small payloads reduce serialization and transfer costs.
 </Callout>
 
 ## Configuration
 
 Queue configuration lives in `config/queue.py` as the `QUEUE_CONFIG` dict, driven by your typed settings:
 
-```python title="config/queue.py"
+```python title="config/queue.py (excerpt)"
+from config.settings import settings
+
 QUEUE_CONFIG = {
     # Active driver: 'redis', 'sqs', 'database', 'sync', or 'null'.
     "default": settings.QUEUE_CONNECTION,
@@ -72,21 +74,21 @@ The environment variables behind it:
 | `QUEUE_NAME` | `default` | Queue(s) a worker listens to. Comma-separated for priority. |
 | `QUEUE_MAX_RETRIES` | `3` | Default maximum attempts per task. |
 | `QUEUE_RETRY_DELAY` | `60` | Default seconds to wait before re-dispatching a failed attempt, for tasks that declare no `delay` label. `0` retries immediately. |
-| `QUEUE_RETRY_AFTER` | `3600` | Visibility timeout used by `queue:prune-orphans`. |
+| `QUEUE_RETRY_AFTER` | `3600` | Database job reservation timeout and the age threshold used by `queue:prune-orphans`. |
 | `REDIS_QUEUE_URL` | falls back to `REDIS_URL` | Redis broker connection. |
 | `REDIS_QUEUE_RESULT_URL` | falls back to `REDIS_QUEUE_URL` | Redis result backend connection. |
 
 ### The in-process connection
 
-`QUEUE_CONNECTION=sync` builds an inline broker: `.kiq()` runs the task before it returns. No server, no worker, nothing to install — the right choice for tests and local development, where a job that fails should fail the caller rather than disappear into a background task.
+`QUEUE_CONNECTION=sync` builds an inline broker: `.kiq()` runs the task before it returns. This is useful for tests and local development without a worker. Unhandled task exceptions propagate to the caller. Tasks configured with a retry policy finish their retries inline; inspect `await task.wait_result()` for their final outcome.
 
-It is a genuinely different execution model, not a lighter Redis:
+With this connection:
 
-- Jobs run **inside** the process that dispatched them, competing with it for the loop.
-- Nothing is persisted. A restart drops everything not yet finished.
+- Jobs run **inside** the process that dispatched them; the caller waits for completion.
+- Jobs are not durably queued. A restart interrupts unfinished work, although tasks may already have written data or produced other side effects.
 - There is **no queue to drain**, so worker processes do not apply — see [Running workers](#running-workers).
 
-The same broker is what you get when `QUEUE_CONNECTION=redis` is selected but no broker URL is configured. That degradation is deliberate — the application still boots with no Redis server available — but it is never silent: the framework logs
+The same broker is used when `QUEUE_CONNECTION=redis` is selected but no broker URL is configured. This fallback applies to a missing URL; it does not handle an unreachable Redis server. The framework logs:
 
 ```
 queue running on the inline broker — jobs execute in the dispatching process; configure the database, Redis or SQS connection for real workers
@@ -102,34 +104,31 @@ Do not ship `sync` (or a URL-less `redis`) to production. Anything dispatched du
 
 It needs exactly two things:
 
-```bash
+```dotenv title=".env"
 QUEUE_CONNECTION=database
 ```
 
 ```bash
-alata migrate   # creates alata_jobs and alata_job_results
+./alata migrate   # creates alata_jobs and alata_job_results
 ```
 
-Everything else has a working default. To tune the driver, add a `database` block to the `connections` dict in `config/queue.py`:
+The scaffold already includes a `database` connection. Tune that entry in `config/queue.py`:
 
-```python title="config/queue.py"
-"connections": {
-    "database": {
-        # Table holding the jobs.
-        "table": "alata_jobs",
-        # Named database connection the queue lives on.
-        "connection": "default",
-        # Seconds an idle worker waits before polling again.
-        "poll_interval": 1.0,
-        # Reservation timeout — see below.
-        "retry_after": settings.QUEUE_RETRY_AFTER,
-        # Table holding finished jobs' results.
-        "result_table": "alata_job_results",
-        # Seconds a result stays readable — see below.
-        "result_ttl": 86400,
-    },
-    # ... redis, sqs
-},
+```python
+QUEUE_CONFIG["connections"]["database"] = {
+    # Table holding the jobs.
+    "table": "alata_jobs",
+    # Named database connection the queue lives on.
+    "connection": "default",
+    # Seconds an idle worker waits before polling again.
+    "poll_interval": 1.0,
+    # Reservation timeout — see below.
+    "retry_after": settings.QUEUE_RETRY_AFTER,
+    # Table holding finished jobs' results.
+    "result_table": "alata_job_results",
+    # Seconds a result stays readable — see below.
+    "result_ttl": 86400,
+}
 ```
 
 `QUEUE_NAME` works exactly as it does on Redis: `QUEUE_NAME=high,default,low` makes the worker drain `high` before `default` before `low`, and dispatches with no explicit queue go to the first name in the list.
@@ -167,7 +166,7 @@ Delivery is therefore **at least once**: acknowledging a job deletes its row, so
 
 #### `attempts` and deferral
 
-`attempts` counts **claims**, not failures. A job that hard-kills its worker — out of memory, `SIGKILL` — never raises anything for the retry middleware to see, so a failure-counted column would leave it poisoning the queue forever; counting deliveries records the attempts nothing survived to report. It is a delivery record on one row, separate from the retry budget: [retries](#retries) still work the same way, re-dispatching through a brand-new row.
+`attempts` counts how many times a job row has been claimed, including after a worker crash. This counter does not enforce a retry limit. [Retry limits](#retries) apply to exceptions handled by the retry middleware, which re-dispatches a new job row for each retry.
 
 The `delay` label defers a dispatch durably — the row is written immediately with `available_at` set into the future, and no worker sees it until then, restart or not.
 
@@ -229,12 +228,12 @@ There is nothing to consume, so `listen()` raises and `queue:work` refuses to st
 Asking a discarded job for its result never blocks. The result is reported as ready immediately and comes back marked as an error — `is_err` is `True`, `return_value` is `None`, and `error` explains that the task was discarded — so `await task.wait_result()` returns at once and `result.raise_for_error()` raises with an actionable message instead of hanging or faking a success.
 
 <Callout type="warn">
-Jobs are dropped silently — that is the whole point of the connection, and there is no per-dispatch warning to alert you (a single informational line at startup notes that dispatches are being discarded). Selecting `null` in an environment that actually needs its jobs to run means that work disappears with no failure anywhere.
+Use `null` only when discarding jobs is intentional. Dispatch succeeds without a warning for each job; result lookups report that the job was discarded.
 </Callout>
 
 ## Defining tasks
 
-Tasks live in `app/tasks/` and are plain async functions decorated with `@broker.task`. Import the broker from `bootstrap/broker.py`:
+Tasks live in `app/tasks/` and are functions decorated with `@broker.task`. Both `async def` and synchronous `def` tasks are supported. Import the broker from `bootstrap/broker.py`:
 
 ```python title="app/tasks/report_tasks.py"
 from bootstrap.broker import broker
@@ -278,7 +277,7 @@ async def request_report(user_id: str, report_id: int) -> None:
     await generate_report_task.kiq(user_id, report_id)
 ```
 
-`kiq()` accepts the same positional and keyword arguments as the task function. The call returns as soon as the message is on the broker.
+`kiq()` accepts the same positional and keyword arguments as the task function. Database, Redis, and SQS dispatches return after enqueueing; the `sync` connection waits for execution, and `null` discards the dispatch.
 
 ### Queue selection
 
@@ -301,7 +300,7 @@ await generate_report_task.kicker().with_labels(tenant="acme").kiq(user_id, repo
 ```
 
 <Callout type="info">
-On `redis`, `sqs`, `sync` and `null`, the `delay` label controls the pause **between retry attempts**, not when a job first runs. The `database` connection is the exception: it stores `available_at` on the row, so a `delay` genuinely defers first delivery too. For "run this at 02:00" style work, reach for the [scheduler](/docs/digging-deeper/scheduling) rather than a long delay.
+On `redis`, `sqs`, and `sync`, the `delay` label controls the pause **between retry attempts**, not when a job first runs. The `database` connection also uses it to defer first delivery. For "run this at 02:00" style work, use the [scheduler](/docs/digging-deeper/scheduling).
 </Callout>
 
 ## Running workers
@@ -314,7 +313,7 @@ Start a worker with the project CLI:
 
 ### Workers need a real broker
 
-A worker consumes messages from a queue that lives outside the process, so it requires `redis` or `sqs`. The in-process broker has no such queue — it cannot be listened to at all.
+A worker consumes messages from a queue that lives outside the process, so it requires `database`, `redis`, or `sqs`. The in-process broker has no such queue — it cannot be listened to at all.
 
 `queue:work` checks the effective connection before it spawns anything. If the queue resolves to the in-process broker, it refuses to start and exits non-zero:
 
@@ -322,13 +321,13 @@ A worker consumes messages from a queue that lives outside the process, so it re
 Cannot start a worker: the queue is running on an in-process broker.
 ```
 
-The message names the fix per connection: `sync` and `null` run (or drop) work in-process and want no worker; `database` needs `alata migrate` to have created its table; `redis` is missing `REDIS_QUEUE_URL` (or `REDIS_URL`); `sqs` is missing `SQS_QUEUE_NAME` and credentials. The redis→inline fallback warning is emitted here too, so the reason shows up in the terminal you ran the worker from.
+The message names the fix per connection: `sync` and `null` run (or drop) work in-process and want no worker; `database` requires its queue tables to exist; `redis` is missing `REDIS_QUEUE_URL` (or `REDIS_URL`); `sqs` is missing `SQS_QUEUE_NAME` and credentials. The redis→inline fallback warning is emitted here too, so the reason shows up in the terminal you ran the worker from.
 
 Options:
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--queue` | `default` | Queue(s) to listen to; comma-separated for priority (`high,default,low`). |
+| `--queue` | Configured queue | Override the queue to consume. Redis and database support a comma-separated priority list (`high,default,low`); SQS accepts one queue. |
 | `--workers` | `2` | Number of concurrent worker processes. |
 | `--reload` | off | Hot-reload on code changes (development). |
 
@@ -340,7 +339,9 @@ Options:
 ./alata queue:work --reload
 ```
 
-Pass `-v` (or `-vv`/`-vvv`) to raise worker log output to `DEBUG`. Under the hood the command sets `QUEUE_NAME` from `--queue` and executes the taskiq worker against `bootstrap.broker:broker` with task discovery over `app/tasks/*_tasks.py` — so a worker is just another entry point into the same application kernel.
+Pass `-v` (or `-vv`/`-vvv`) to raise worker log output to `DEBUG`. The command discovers task modules matching `app/tasks/*_tasks.py` and starts the worker against `bootstrap.broker:broker`.
+
+An explicit `--queue` takes precedence over configured queue names. Without it, workers use `QUEUE_NAME` for Redis/database or `SQS_QUEUE_NAME` for SQS.
 
 <Callout type="info">
 For a supervised worker pool with a web dashboard — job status, runtimes, batches, failures — see the [Horizon package](/docs/packages/horizon). `queue:work` starts a bare worker process directly.
@@ -361,7 +362,7 @@ A failed attempt is re-dispatched with an incremented internal `_retries` counte
 Exactly one party waits, and which one depends on the connection:
 
 - **The broker**, on connections that can schedule delivery — the `database` connection writes the retried job with `available_at` set into the future, so nothing can claim it until then. The retry is re-dispatched immediately with the delay attached, and **no worker is blocked** while it elapses.
-- **The worker**, on connections that can only accept a job for immediate delivery — `redis`, `sqs`, and the in-process and null connections. There the middleware sleeps the backoff before re-dispatching, so the worker slot is occupied for `delay` seconds.
+- **The worker**, on `redis` and `sqs`. The middleware waits before re-dispatching, occupying a task slot for `delay` seconds. On `sync`, this wait happens in the dispatching process. The `null` connection never executes or retries jobs.
 
 The effective delay is the same either way, whether it came from the task's `delay` label or from `QUEUE_RETRY_DELAY`; only the party doing the waiting differs. Sizing `QUEUE_RETRY_DELAY` generously is cheap on a deferring connection and costs worker throughput on the others — a long backoff on `redis` means workers parked doing nothing, so scale worker count with it or keep the delay short.
 
@@ -402,7 +403,7 @@ Handlers may be sync or async; a handler that raises is logged and never crashes
 
 ## Job batches
 
-A batch dispatches a group of jobs and tracks them as one unit — with completion callbacks that fire exactly once when the whole group finishes. Build one with `Batch.create()` and the `job()` helper:
+A batch dispatches a group of jobs and tracks them as one unit, with callbacks queued when the group finishes. Build one with `Batch.create()` and the `job()` helper:
 
 ```python
 from alata.queue.batch import Batch, job
@@ -434,7 +435,7 @@ Each callback method can be called multiple times to register several callback j
 
 ### How batch accounting works
 
-Dispatching records the batch in the `alata_job_batches` table with `total_jobs` and `pending_jobs` counters. As each tagged job reaches a **final** outcome, the framework's `BatchMiddleware` atomically decrements `pending_jobs` (under a row lock, so exactly one worker observes the transition to zero — callbacks fire exactly once even when the last two jobs finish concurrently). Permanent failures increment `failed_jobs` and append the task id to `failed_job_ids`.
+Dispatching records the batch in the `alata_job_batches` table with `total_jobs` and `pending_jobs` counters. As each tagged job reaches a **final** outcome, the framework updates its progress. Permanent failures increment `failed_jobs` and append the task id to `failed_job_ids`. Completion callbacks are queued jobs too; make their side effects safe to repeat.
 
 Batch accounting is **retry-aware**: a failed attempt that the retry middleware will re-dispatch is not a final outcome, so it neither decrements `pending_jobs` nor counts as a batch failure. Only the job's last attempt — success, or failure with retries exhausted — moves the counters. The `catch` callbacks therefore run at batch completion when any job has *permanently* failed, not on the first failed attempt.
 

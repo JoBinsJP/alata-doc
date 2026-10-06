@@ -13,33 +13,26 @@ Alata provides request-scoped context variables built on Python's `contextvars` 
 ```python
 from alata.context import request_context, user_id_context
 
-user_id_context: ContextVar[str | None]   # the authenticated user's id
+user_id_context: ContextVar[str | None]   # the acting user's id
 request_context: ContextVar[dict | None]  # arbitrary per-request metadata
 ```
 
-Both default to `None`. The framework declares them but does **not** populate them — that's your application's job, typically in middleware, which is what makes them request-scoped in practice.
+Both default to `None`. Application middleware supplies their values. The scaffold populates `user_id_context` from identity headers; `request_context` is available for your own metadata. See [middleware](/docs/basics/middleware#writing-your-own-middleware) for the complete ASGI example.
 
 ## Setting context from middleware
 
 Set a variable with `.set()`, which returns a token, and restore the previous value with `.reset(token)` when the request ends:
 
-```python title="app/http/middleware.py"
-from alata.http import BaseHTTPMiddleware
-
-from alata.context import user_id_context
+```python
+from alata.context import request_context
 
 
-class IdentityMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        identity = resolve_user_id(request)  # your auth logic; None when anonymous
-        if identity is None:
-            return await call_next(request)  # leave the context unset
-
-        token = user_id_context.set(identity)
-        try:
-            return await call_next(request)
-        finally:
-            user_id_context.reset(token)
+async def handle_with_context(scope, receive, send, app):
+    token = request_context.set({"tenant": scope.get("state", {}).get("tenant_id")})
+    try:
+        await app(scope, receive, send)
+    finally:
+        request_context.reset(token)
 ```
 
 Set `user_id_context` only when a *real* identity was resolved — an authenticated user id, or a per-session guest id — never a fallback constant like `"anonymous"`. The [rate limiter](/docs/digging-deeper/rate-limiting) keys its buckets on this variable, so a constant would merge every unauthenticated caller into one shared bucket; left unset, those callers are keyed per client IP instead.
@@ -76,5 +69,5 @@ class Handler(ExceptionHandler):
 ```
 
 <Callout type="warn">
-Context variables live inside one process. They do not travel with a [queued job](/docs/digging-deeper/queues) — a worker runs in a different process with fresh, empty context. Pass anything a job needs (like the user id) as an explicit task argument.
+Context variables live inside one process. They are not serialized with a [queued job](/docs/digging-deeper/queues). External workers run in a different process; the inline `sync` connection executes in the dispatching process. Pass anything a job needs (like the user id) as an explicit task argument.
 </Callout>

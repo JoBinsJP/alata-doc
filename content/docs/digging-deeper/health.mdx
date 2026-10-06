@@ -26,11 +26,13 @@ Runs a real `SELECT 1` against **every registered async database connection**. R
 {"status": "ok", "connections": {"default": "ok"}}
 ```
 
-If any connection fails — or no connections are registered at all — it returns `503` with the error per connection:
+If a connection fails, it returns `503` with the error per connection:
 
 ```json
 {"status": "unavailable", "connections": {"default": "connection refused ..."}}
 ```
+
+If no async connections are registered, it returns `503` with a `detail` message instead of a `connections` map.
 
 Binary pass/fail on purpose: this is the endpoint for Kubernetes readiness probes and load-balancer target checks, so a database outage takes the instance out of rotation.
 

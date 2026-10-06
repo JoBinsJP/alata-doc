@@ -1,13 +1,13 @@
 ---
 title: Routing
-description: Define HTTP routes with standard ASGI decorators and organize them the Alata way.
+description: Define routes with Alata Router, controller methods, and FastAPI dependencies.
 icon: Route
 ---
 
-Alata's HTTP layer is FastAPI. Routes are plain `APIRouter` definitions — the same decorators, path parameters, and dependency system you may already know — and Alata adds the conventions around them: where route files live, how they are registered onto the one application kernel, and how routes reach services bound in the [service container](/docs/architecture/container).
+Alata's HTTP layer is FastAPI. Alata's `Router` extends FastAPI's `APIRouter` with direct controller registration and resource routes, while retaining its decorators, path parameters, and dependency system — and Alata adds the conventions around them: where route files live, how they are registered onto the one application kernel, and how routes reach services bound in the [service container](/docs/architecture/container).
 
 <Callout type="info">
-Route *syntax* on this page is standard ASGI/FastAPI. What is Alata-specific is the organization: `routes/` files, controller classes in `app/http/controllers/`, and registration through your app's HTTP provider during the [boot lifecycle](/docs/architecture/lifecycle).
+Use Alata `Router` or FastAPI `APIRouter` in `routes/`. Both support registration through your app's HTTP provider during the [boot lifecycle](/docs/architecture/lifecycle).
 </Callout>
 
 ## Where Routes Live
@@ -16,12 +16,10 @@ A fresh application ships one route file, `routes/api.py`, containing a single t
 
 ```python title="routes/api.py"
 from app.http.controllers.welcome_controller import WelcomeController
-from alata.http import APIRouter
+from alata.http import Router
 
-api_router = APIRouter(prefix="/api/v1")
-welcome_controller = WelcomeController()
-
-api_router.get("/")(welcome_controller.index)
+api_router = Router(prefix="/api/v1")
+api_router.get("/", WelcomeController().index)
 ```
 
 <Callout type="info">
@@ -39,7 +37,7 @@ class WelcomeController:
         return {"message": "Welcome to Alata Framework!"}
 ```
 
-Registering a bound method with `api_router.get("/")(welcome_controller.index)` is equivalent to using the decorator form — it keeps handler logic in a controller class while the route file stays a thin, readable route table. Decorator-style function handlers work exactly the same way if you prefer them:
+Registering a bound method with `api_router.get("/", WelcomeController().index)` is equivalent to using the decorator form — it keeps handler logic in a controller class while the route file stays a thin, readable route table. Decorator-style function handlers work exactly the same way if you prefer them:
 
 ```python title="routes/api.py"
 @api_router.get("/ping")
@@ -57,8 +55,10 @@ from alata.http import FastapiProvider as HttpProvider
 
 class FastapiProvider(HttpProvider):
     def boot(self):
+        from app.exceptions.handler import Handler
         from routes.api import api_router
 
+        Handler().bootstrap(self.app.fastapi)
         self.app.fastapi.include_router(api_router)
 ```
 
@@ -132,6 +132,8 @@ async def me(user_id: str = Depends(require_authenticated)):
 
 `get_user_id` reads the acting user from `request.state` (set by the identity [middleware](/docs/basics/middleware)); `require_authenticated` raises a 401 when the caller is anonymous.
 
+The scaffold reads identity headers for demonstration; it does not verify credentials. Replace this with validated session or token authentication before using these helpers to protect routes.
+
 ### Application services: the container
 
 Services registered by [providers](/docs/architecture/providers) are resolved from the container. The `container` import is a proxy that always targets the current container, so it is safe to import at module level:
@@ -179,8 +181,10 @@ async def index():
 ```python title="routes/api.py"
 from routes.orders import orders_router
 
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(orders_router)   # served at /api/v1/orders
+from alata.http import Router
+
+api_router = Router(prefix="/api/v1")
+api_router.include_router(orders_router)   # served at /api/v1/orders/
 ```
 
 You can also apply a prefix at mount time — `include_router(admin_router, prefix="/admin")` — or attach shared guards to a whole group with router-level dependencies:

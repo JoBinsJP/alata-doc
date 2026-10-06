@@ -8,7 +8,7 @@ Everything in an Alata application flows through a single object: the `Applicati
 
 ## One kernel, three entry points
 
-An Alata project has exactly one application kernel. HTTP requests, console commands, and queue workers are just different views over it — they all share the same [service container](/docs/architecture/container), the same configuration, and the same [service providers](/docs/architecture/providers).
+HTTP, console, and worker entry points use the same kernel definition, configuration, and [service providers](/docs/architecture/providers). Each process has its own application and [service container](/docs/architecture/container); in-memory services are not shared across processes.
 
 The kernel is constructed once, in `bootstrap/application.py`:
 
@@ -55,7 +55,7 @@ broker = app.make("queue.broker")
 - **Queue workers** — the taskiq worker CLI targets `bootstrap.broker:broker`. Importing that module boots the whole application, so tasks get initialized database engines and every other service with no worker-specific setup.
 
 <Callout type="info">
-Because importing `bootstrap.application` runs the full synchronous provider lifecycle as a module-level side effect, a binding registered by any provider is visible to HTTP handlers, CLI commands, and queue tasks alike. There is never a "worker container" that drifted from the "web container".
+Because importing `bootstrap.application` runs the full synchronous provider lifecycle as a module-level side effect, a binding registered by any provider is visible to HTTP handlers, CLI commands, and queue tasks alike. The entry points use the same provider list. Async startup hooks run only when the application lifespan is driven.
 </Callout>
 
 ## Constructing the Application

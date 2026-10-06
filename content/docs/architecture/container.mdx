@@ -142,25 +142,9 @@ handle_search("python developer")  # 'log' is auto-injected
 
 ## Resetting: `flush()`
 
-Use `flush()` to reset a container between tests:
+`flush()` removes a container's bindings and boot state. Use it to clean up an isolated test container, then restore the previous container as shown above. The [testing guide](/docs/testing#the-conftest-pattern) provides a reusable fixture.
 
-```python
-import pytest
-from alata.container import container
-
-@pytest.fixture
-def fresh_container():
-    yield container
-    container.flush()
-
-def test_my_service(fresh_container):
-    fresh_container.singleton("svc", lambda: MyService())
-    assert isinstance(fresh_container.make("svc"), MyService)
-```
-
-<Callout type="error">
-Never call `flush()` on the live container in production code — it unbinds everything the providers registered, and the application will start raising `KeyError` on the next resolution.
-</Callout>
+Do not flush the application's shared container while it is serving requests or between tests that reuse that application. Re-importing its bootstrap module does not reconstruct it.
 
 ## API reference
 

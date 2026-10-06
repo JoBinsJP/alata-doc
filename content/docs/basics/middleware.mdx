@@ -11,6 +11,8 @@ Middleware wraps every HTTP request, running code before it reaches your routes 
 All middleware settings live in `config/middleware.py` as plain dicts:
 
 ```python title="config/middleware.py"
+from config.settings import settings
+
 CORS = {
     "allow_origins": ["http://localhost:3000"],
     "allow_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -123,11 +125,11 @@ Paths listed in `MAINTENANCE_MODE["bypass_paths"]` are served normally while the
 GET /api/v1/orders → 200 (0.042s) [user-123] rid=a1b2c3d4
 ```
 
-It logs the method, path, status code, duration, acting user (from `request.state.user_id` when the identity middleware has set it, otherwise `-`), and a request id.
+It logs the method, path, status code, time until the response starts, acting user (from `request.state.user_id` when the identity middleware has set it, otherwise `-`), and a request id.
 
 ### Request IDs
 
-The middleware reads the incoming `X-Request-ID` header — or generates a short id if absent — stores it on `request.state.request_id`, and sets `X-Request-ID` on the response. Pass the header between services and you can trace a single request across your whole system.
+The middleware reads the incoming `X-Request-ID` header — or generates a short id if absent — stores it on `request.state.request_id`, and sets `X-Request-ID` on responses for paths that are not excluded. Pass the header between services and you can trace a single request across your whole system.
 
 ### Log Levels
 
@@ -145,59 +147,85 @@ The level is chosen from the outcome:
 In `config/middleware.py`, `REQUEST_LOGGING` supports:
 
 - `enabled` — set `False` to skip registering the middleware entirely.
-- `exclude_paths` — endpoints that are never logged (health checks, `/docs`, metrics). Excluded requests still receive a request id.
+- `exclude_paths` — endpoints that are never logged (health checks, `/docs`, metrics). Excluded requests still have `request.state.request_id`, but this middleware does not add the response header for them.
 - `slow_request_threshold` — seconds before a request is flagged `SLOW`.
 
 ## Writing Your Own Middleware
 
-Middleware is a standard ASGI `BaseHTTPMiddleware` subclass with a `dispatch` method. The scaffold's `IdentityMiddleware` is a complete example:
+The scaffold uses plain ASGI middleware. Its identity middleware passes non-HTTP scopes through and resets request context when the request ends:
 
 ```python title="app/http/middleware.py"
-from alata.http import BaseHTTPMiddleware, Request
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from alata.context import user_id_context
 
 
-class IdentityMiddleware(BaseHTTPMiddleware):
-    """Resolve the acting user from headers into request.state and the request context."""
+class IdentityMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
 
-    async def dispatch(self, request: Request, call_next):
-        user_id = request.headers.get("X-User-Id")
-        guest_id = request.headers.get("X-Guest-Id")
-        identity = user_id or guest_id  # None when neither header is present
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
-        request.state.user_id = identity or "anonymous"
+        headers = Headers(scope=scope)
+        identity = headers.get("X-User-Id") or headers.get("X-Guest-Id")
+        scope.setdefault("state", {})["user_id"] = identity or "anonymous"
         if identity is None:
-            # Context untouched: throttling falls back to per-client-IP keys.
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         token = user_id_context.set(identity)
         try:
-            return await call_next(request)
+            await self.app(scope, receive, send)
         finally:
             user_id_context.reset(token)
 ```
 
-It publishes the identity two ways. `request.state.user_id` always has a value — the `"anonymous"` fallback keeps display and logging simple. The `user_id_context` [context variable](/docs/digging-deeper/context) is set only for *real* identities (a user id, or a per-session guest id) and is reset after the response so identity never leaks between requests sharing a worker. The [rate limiter](/docs/digging-deeper/rate-limiting) keys buckets on the context variable, which is why the constant fallback never goes there.
+The scaffold reads identity headers for demonstration; it does not verify credentials. Replace this with validated session or token authentication before using these helpers to protect routes.
 
-Everything before `await call_next(request)` runs on the way in; everything after runs on the way out, with the response in hand:
+`request.state.user_id` always has a value. Leave `user_id_context` unset for anonymous callers so the [rate limiter](/docs/digging-deeper/rate-limiting) can use their client IP instead of grouping them under a shared `"anonymous"` key.
+
+To add a response header, wrap the ASGI `send` callable:
 
 ```python title="app/http/middleware.py"
-class TimingHeaderMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        import time
+import time
+
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+
+class TimingHeaderMiddleware:
+    def __init__(self, app: ASGIApp, header_name: str = "X-Elapsed"):
+        self.app = app
+        self.header_name = header_name
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
         start = time.perf_counter()
-        response = await call_next(request)
-        response.headers["X-Elapsed"] = f"{time.perf_counter() - start:.3f}"
-        return response
+
+        async def send_response(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                elapsed = time.perf_counter() - start
+                MutableHeaders(scope=message)[self.header_name] = f"{elapsed:.3f}"
+            await send(message)
+
+        await self.app(scope, receive, send_response)
 ```
+
+The header measures time until the response starts, including for streaming responses. `BaseHTTPMiddleware` remains supported for middleware that uses its `dispatch` API.
 
 ### Registering It
 
 Add it to the stack in your app's `FastapiProvider.register()`:
 
 ```python title="app/providers/fastapi_provider.py"
+from alata.http import FastapiProvider as HttpProvider
 from app.http.middleware import TimingHeaderMiddleware
 
 
@@ -208,17 +236,10 @@ class FastapiProvider(HttpProvider):
         self.app.fastapi.add_middleware(TimingHeaderMiddleware)
 ```
 
-Middleware classes that take options accept them as keyword arguments to `add_middleware`, delivered to your `__init__`:
+Pass constructor options as keyword arguments to `add_middleware`:
 
 ```python
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, limit: int = 100):
-        super().__init__(app)
-        self._limit = limit
-```
-
-```python
-self.app.fastapi.add_middleware(RateLimitMiddleware, limit=60)
+self.app.fastapi.add_middleware(TimingHeaderMiddleware, header_name="X-Response-Time")
 ```
 
 Follow the scaffold's convention and source those options from a dict in `config/middleware.py` so all tuning stays in one file.
@@ -228,5 +249,5 @@ Follow the scaffold's convention and source those options from a dict in `config
 </Callout>
 
 <Callout type="warn">
-Middleware runs on **every** request, including excluded and bypassed paths (the exclusion happens inside the middleware's own `dispatch`). Keep `dispatch` fast and non-blocking — no synchronous I/O — or every endpoint pays the cost.
+Middleware runs on **every** request, including excluded and bypassed paths (each middleware handles its own exclusions). Keep middleware fast and non-blocking — no synchronous I/O — or every endpoint pays the cost.
 </Callout>

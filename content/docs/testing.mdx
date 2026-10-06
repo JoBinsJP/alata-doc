@@ -1,10 +1,10 @@
 ---
 title: Testing
-description: Test your Alata application with pytest, HTTP test cases, fluent JSON assertions, and per-test database rollbacks.
+description: Test your Alata application with pytest, HTTP test cases, fluent JSON assertions, and database transaction examples.
 icon: TestTube
 ---
 
-Alata is built to be tested. The framework ships first-class testing utilities — an HTTP test case that drives your application through its real kernel, a fluent assertion API for JSON responses, and a database mixin that rolls back every test's writes — all designed to plug straight into pytest.
+Alata is built to be tested. The framework ships first-class testing utilities — an HTTP test case that drives your application through its real kernel, a fluent assertion API for JSON responses, and database transaction helpers — all designed to plug straight into pytest.
 
 ## Getting Started
 
@@ -31,46 +31,56 @@ With `asyncio_mode = "auto"`, any async test function is collected and awaited a
 
 ### The conftest pattern
 
-Two things must happen **before** any application module is imported: the environment must be set to `testing`, and the database name must be overridden so tests can never touch your development data. Because pytest imports test modules (and anything they import — including `bootstrap.application`) during collection, do this at the very top of `tests/conftest.py`, before any other import:
+Create a dedicated database for tests and configure it in `.env.testing`. Application boot loads `.env` first and then this overlay, so an early `os.environ["DB_DATABASE"]` assignment alone is not enough.
+
+```dotenv title=".env.testing"
+APP_ENV=testing
+ENVIRONMENT=local
+DB_DATABASE=myapp_test
+CACHE_STORE=memory
+QUEUE_CONNECTION=sync
+LOG_CHANNEL=null
+```
+
+Set the test database host, port, user, and password here as well if they differ from development. Prepare its schema before running the suite:
+
+```bash
+./alata migrate --env testing
+```
+
+Select this environment before pytest imports any application modules. Loading the overlay here also covers tests that use the module-level `boot()` helper:
 
 ```python title="tests/conftest.py"
 import os
+from pathlib import Path
 
-# ── EARLY OVERRIDES — must run before any app module is imported ──────────
-os.environ.setdefault("APP_ENV", "testing")
-os.environ["DB_DATABASE"] = os.environ.get("TEST_DB_NAME", "myapp_test")
+import pytest
+from dotenv import load_dotenv
 
-import pytest  # noqa: E402
+from alata.container import ServiceContainer
 
-from alata.container import container  # noqa: E402
+
+TEST_ENV = Path(__file__).resolve().parents[1] / ".env.testing"
+if not TEST_ENV.is_file():
+    raise pytest.UsageError("Create .env.testing with a dedicated test database first.")
+load_dotenv(TEST_ENV, override=True)
+os.environ["APP_ENV"] = "testing"
 
 
 @pytest.fixture
 def fresh_container():
-    """A clean container for each test — flushed afterwards.
-
-    Does NOT boot providers, making it ideal for unit tests that
-    register their own fakes.
-    """
-    yield container
-    container.flush()
-
-
-@pytest.fixture
-def booted_container():
-    """Boot the full provider lifecycle, then flush after the test.
-
-    Use for integration-style tests that need real services
-    (logging, the queue broker, the database engine, ...).
-    """
-    from alata.application import boot
-
-    boot()
-    yield container
-    container.flush()
+    """An isolated container for unit tests that register their own services."""
+    previous = ServiceContainer.get_instance()
+    isolated = ServiceContainer()
+    ServiceContainer.set_instance(isolated)
+    try:
+        yield isolated
+    finally:
+        isolated.flush()
+        ServiceContainer.set_instance(previous)
 ```
 
-`container.flush()` resets everything on the active container: all singleton, factory, and instance bindings, the type map used for auto-injection, and the booted flag. The next test that calls `boot()` starts from a genuinely clean slate — no state leaks between tests.
+Use the isolated container for unit tests:
 
 ```python title="tests/test_container_wiring.py"
 def test_singleton_returns_same_instance(fresh_container):
@@ -79,9 +89,7 @@ def test_singleton_returns_same_instance(fresh_container):
     assert fresh_container.make("svc") is fresh_container.make("svc")
 ```
 
-<Callout type="info">
-The `container` handle you import is a call-time proxy to whichever container currently governs the process — the base container in module-level tests, or the `Application` once one is constructed. Flushing through the proxy always flushes the *active* container, which is exactly what you want in a teardown. See [service container](/docs/architecture/container) for how the proxy works.
-</Callout>
+For integration tests, use the application's kernel and lifecycle as shown below. Do not flush the shared application after each test: importing `bootstrap.application` again returns its existing Python module and application object.
 
 ## HTTP Tests
 
@@ -101,9 +109,21 @@ class ApiTestCase(HttpTestCase):
         from bootstrap.application import app
 
         return app
+
+    async def asyncSetUp(self):
+        app = self.get_application().fastapi
+        self._lifespan = app.router.lifespan_context(app)
+        await self._lifespan.__aenter__()
+        await super().asyncSetUp()
+
+    async def asyncTearDown(self):
+        try:
+            await super().asyncTearDown()
+        finally:
+            await self._lifespan.__aexit__(None, None, None)
 ```
 
-Every test class that extends your `ApiTestCase` gets an `httpx.AsyncClient` wired to the kernel, plus async helper methods for each verb — `get`, `post`, `put`, `patch`, and `delete` — that each return a `TestResponse`:
+`HttpTestCase` creates the HTTP client; the base class above also runs application startup and shutdown, including async provider hooks. Every test class that extends your `ApiTestCase` gets an `httpx.AsyncClient` wired to the kernel, plus async helper methods for each verb — `get`, `post`, `put`, `patch`, and `delete` — that each return a `TestResponse`:
 
 ```python title="tests/test_users.py"
 class TestUsers(ApiTestCase):
@@ -216,9 +236,9 @@ response.assert_stream_contains("Hello")
 
 ## Database Testing
 
-### Rolling back with `DatabaseTransaction`
+### Rolling back test writes
 
-Add the `DatabaseTransaction` mixin to a test class and every test runs inside a database transaction that is rolled back afterwards — writes never persist between tests:
+Add `DatabaseTransaction` before your API test base class to roll back test writes automatically:
 
 ```python title="tests/test_signup.py"
 from alata.db.testing import DatabaseTransaction
@@ -232,35 +252,26 @@ class TestSignup(DatabaseTransaction, ApiTestCase):
             "name": "Bedu",
             "email": "bedu@example.com",
         })
-
         response.assert_created()
-        # The INSERT above is rolled back when this test finishes.
 ```
 
-Under the hood the mixin calls `DB.abegin_transaction()` in `asyncSetUp` and `DB.arollback()` in `asyncTearDown` — the same manual transaction API from the [database layer](/docs/database/getting-started), applied to the default connection.
+The mixin wraps the default async connection. Call `await super().asyncSetUp()` before creating test data and `await super().asyncTearDown()` after custom teardown. Rollback also runs when setup, the test, or teardown fails.
 
-<Callout type="warn">
-List `DatabaseTransaction` **before** the HTTP test case in the base-class list, as shown above. Python's method resolution order then runs the HTTP client setup first and opens the transaction after it, and unwinds in the reverse order on teardown.
-</Callout>
+Writes through sync sessions, other connections, independent tasks or processes, or code that commits the outer transaction need separate cleanup. See [transactions](/docs/database/getting-started#transactions).
 
 ### A dedicated test database
 
-Rollbacks protect you within a run, but your tests should also point at their own database entirely. The early `DB_DATABASE` override in the [conftest pattern](#the-conftest-pattern) handles this: it patches the environment before `config/database.py` is ever imported, so every engine the test run builds connects to the test database. You can go further and prepare the schema once per session with the migrator:
+Use the `.env.testing` setup from the [conftest pattern](#the-conftest-pattern), even when using transaction rollbacks. Check the resolved database before any test setup that changes the schema:
 
-```python title="tests/conftest.py"
-def pytest_sessionstart(session):
-    """Fresh-migrate the test database before the suite runs."""
-    from alata.application import boot
-    from alata.container import container
-    from alata.db import get_engine
-    from alata.db.migrator import Migrator
+```python
+from alata.db import get_engine
+from bootstrap.application import app
 
-    boot()
-    Migrator(get_engine()).fresh()
-    container.flush()
+assert app.env == "testing"
+assert get_engine().url.database == "myapp_test"
 ```
 
-`Migrator.fresh()` drops all tables and replays every migration from scratch, so the suite always starts from the exact schema your migrations describe.
+Run migrations against that database explicitly. `migrate:fresh` drops its tables; it should not be an automatic consequence of importing test modules or starting pytest.
 
 ## Swapping Services with Fakes
 
@@ -275,42 +286,41 @@ class FakeMailer:
         self.sent.append((to, subject, body))
 
 
-async def test_signup_sends_welcome_mail(booted_container):
+async def test_signup_sends_welcome_mail(fresh_container):
     mailer = FakeMailer()
-    booted_container.instance("mailer", mailer)   # override the real binding
+    fresh_container.instance("mailer", mailer)   # override the real binding
 
     await register_user(name="Bedu", email="bedu@example.com")
 
     assert len(mailer.sent) == 1
 ```
 
-`container.instance()` registers a pre-built object, replacing whatever factory or singleton was bound under that name. The fixture's `container.flush()` teardown removes the fake afterwards.
+`container.instance()` registers a pre-built object, replacing whatever factory or singleton was bound under that name. The isolated container fixture discards the fake afterwards and restores the previous container.
 
 If you fake often, a tiny helper fixture keeps tests tidy:
 
 ```python title="tests/conftest.py"
 @pytest.fixture
-def fake():
+def fake(fresh_container):
     """Register fake bindings: fake("storage", MockStorage())."""
     def _fake(name: str, factory_or_value) -> None:
         if callable(factory_or_value):
-            container.bind(name, factory_or_value)
+            fresh_container.bind(name, factory_or_value)
         else:
-            container.instance(name, factory_or_value)
+            fresh_container.instance(name, factory_or_value)
 
-    yield _fake
-    container.flush()
+    return _fake
 ```
 
 ## Testing Queued Tasks
 
-Queued tasks are plain async functions under the decorator, so you can test their logic by calling them directly — the decorator's `__call__` invokes the original function without touching the broker:
+Call a decorated task directly to test its logic without dispatching it. Await an `async def` task as below; call a synchronous `def` task without `await`:
 
 ```python title="tests/test_email_tasks.py"
 from app.tasks.email_tasks import send_welcome_email
 
 
-async def test_welcome_email_builds_the_right_message(booted_container):
+async def test_welcome_email_builds_the_right_message():
     result = await send_welcome_email(user_id=1)   # runs inline, no broker
 
     assert result["subject"] == "Welcome!"
@@ -325,7 +335,7 @@ from app.services.registration import register_user
 from app.tasks.email_tasks import send_welcome_email
 
 
-async def test_signup_dispatches_welcome_email(booted_container):
+async def test_signup_dispatches_welcome_email():
     with patch.object(send_welcome_email, "kiq", new=AsyncMock()) as kiq:
         await register_user(name="Bedu", email="bedu@example.com")
 
@@ -358,5 +368,5 @@ uv run pytest -k "signup"     # by keyword
 ```
 
 <Callout type="info">
-Set `TEST_DB_NAME` in your environment (or CI) to control which database the suite targets — the conftest override above falls back to a `_test`-suffixed default so a plain `pytest` run is always safe.
+In CI, generate `.env.testing` with the isolated database credentials before running migrations and pytest.
 </Callout>

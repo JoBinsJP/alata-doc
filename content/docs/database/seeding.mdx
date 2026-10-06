@@ -92,7 +92,7 @@ Calling the sync form from inside an async `run()` raises immediately with a mes
 
 A seeder that raises does not spill a traceback: the command names the innermost seeder that actually failed — not the composer you asked for — prints its error, and exits `1`. A seeder module that fails to import surfaces its own `ImportError` rather than being reported as missing.
 
-`db:seed` boots the whole application before seeding — unlike the `migrate` family's database-only boot — precisely so your models and services are available.
+`./alata db:seed` runs through the application kernel, so registered models and services are available to seeders.
 
 ## Generating Seeders
 

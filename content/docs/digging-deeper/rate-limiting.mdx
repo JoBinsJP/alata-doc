@@ -67,7 +67,7 @@ Endpoints that build and return their own `Response` objects get the success hea
 
 ## Customizing the key
 
-"60 per minute" means 60 per minute *per caller*. By default the caller is the user id from the [request context](/docs/digging-deeper/context) when one is set, and the client IP otherwise. The scaffold's `IdentityMiddleware` publishes authenticated ids into the context for you.
+"60 per minute" means 60 per minute *per caller*. By default the caller is the user id from the [request context](/docs/digging-deeper/context) when one is set, and the client IP otherwise. The scaffold's `IdentityMiddleware` reads caller-supplied identity headers. Replace it with verified authentication before using identity-based limits; otherwise callers can change the header to obtain a new bucket.
 
 <Callout type="warn">
 Publish real identities only (a per-session guest id counts as real). A middleware that sets `user_id_context` to a fallback constant like `"anonymous"` puts every unauthenticated caller in one shared bucket, letting a single client exhaust the limit for everyone. Leave the context unset for unknown callers — they fall back to per-IP buckets.
@@ -80,9 +80,6 @@ from alata.http import Request
 
 
 def client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return f"ip:{forwarded.split(',')[0].strip()}"
     return f"ip:{request.client.host}" if request.client else "ip:unknown"
 ```
 
@@ -92,11 +89,11 @@ async def login():
     ...
 ```
 
-Login, registration, and password-reset routes have no user yet, so key them on the address — reading the forwarded header only if your proxy overwrites it on every request. Any request attribute works the same way:
+Login, registration, and password-reset routes can use the client address. Behind a proxy, configure the ASGI server to accept forwarded addresses only from trusted proxies. For an API key, derive the bucket from the credential your authentication dependency has already verified:
 
 ```python
 def api_key(request: Request) -> str:
-    return f"key:{request.headers.get('X-Api-Key', 'anonymous')}"
+    return f"key:{request.state.api_key_id}"
 
 
 @router.get("/v1/events", dependencies=[Depends(throttle("1000/hour", key=api_key))])
@@ -105,7 +102,7 @@ async def events():
 ```
 
 <Callout type="warn">
-A server on a unix socket behind a reverse proxy reports no client address, so IP-keyed buckets collapse into one shared bucket (the limiter logs a warning once). Key on the header your proxy is trusted to set, as above, or serve on a TCP port with proxy headers enabled.
+A server on a unix socket behind a reverse proxy reports no client address, so IP-keyed buckets collapse into one shared bucket (the limiter logs a warning once). Use a verified identity key or configure trusted proxy address handling.
 </Callout>
 
 ## Limit objects
@@ -210,6 +207,7 @@ async def send_otp(user_id: int) -> None:
 Clear the bucket on success so a caller who gets it right is not left locked out:
 
 ```python title="app/services/auth.py"
+from alata.container import container
 from alata.exceptions import AuthenticationError, UnprocessableError
 
 

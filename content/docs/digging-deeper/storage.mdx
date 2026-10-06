@@ -63,15 +63,15 @@ public = Storage.disk("public")   # resolving another disk cannot re-point `priv
 
 await something_slow()            # other tasks may resolve other disks meanwhile
 
-private.put("payroll.csv", data)  # still lands on the private disk
+await private.aput("payroll.csv", data)  # still lands on the private disk
 ```
 
-That makes a disk handle safe to hold across `await` points, to stash on an object, or to hand to a worker thread. The manager's cache is built under a lock, so concurrent first-use from several threads still yields exactly one instance per disk.
+You can retain a disk handle across `await` points; resolving another disk does not change it.
 
 `Storage` (the manager, not the facade) also accepts driver **classes** through `add_driver("name", DriverClass)` when you register your own driver; a driver instance is still accepted and used as a prototype, cloned per disk. Custom drivers should accept `(application, options)` in their constructor — the older `set_options(options)` setter also still works.
 
 <Callout type="warn">
-The plain storage methods are **synchronous** — they block while reading, writing, or talking to S3. In async code, use the `a`-prefixed twins ([Async usage](#async-usage)): `await Storage.disk("s3").aput(key, data)`. Blocking calls belong in [queued jobs](/docs/digging-deeper/queues) or other sync contexts.
+The plain storage methods are **synchronous** — they block while reading, writing, or talking to S3. In async code, use the `a`-prefixed twins ([Async usage](#async-usage)): `await Storage.disk("s3").aput(key, data)`. Use plain methods in synchronous handlers, synchronous [jobs](/docs/digging-deeper/queues), or console commands.
 </Callout>
 
 ## Driver API
@@ -90,12 +90,24 @@ disk.put("reports/2026/summary.pdf", pdf_bytes)
 
 `put(path, content)` accepts `str` or `bytes` and returns the content it wrote.
 
-`put_file(directory, file, name=None)` stores an uploaded-file-like object (anything with a `.name` attribute, and optionally a `get_content()` method) into a directory. Without an explicit `name` it generates a UUID, preserving the original extension, and returns the relative path it stored:
+For FastAPI uploads, read the `UploadFile` and pass its bytes to `aput`. Generate the storage key yourself:
 
 ```python
-path = disk.put_file("uploads/avatars", upload)
-# "uploads/avatars/8f14e45f-....png"
+from uuid import uuid4
+
+from fastapi import UploadFile
+from alata.support.storage import Storage
+
+
+async def save_upload(upload: UploadFile) -> str:
+    key = f"uploads/{uuid4().hex}"
+    await Storage.disk().aput(key, await upload.read())
+    return key
 ```
+
+An endpoint accepting multipart uploads also needs `python-multipart` (`uv add python-multipart`).
+
+`put_file(directory, file, name=None)` supports a different file interface: an object with `.name` whose `get_content()` returns text or bytes, or a bytes-compatible object with `.name`. It returns a generated path, preserving the extension. FastAPI's `UploadFile` does not implement that interface; use the example above.
 
 `append(path, content)` adds to the end of a file; `prepend(path, content)` adds to the beginning.
 
@@ -126,13 +138,15 @@ On S3, `get_files()` lists objects by prefix across the whole "directory" tree; 
 
 ```python
 disk.copy("reports/draft.txt", "reports/final.txt")
-disk.move("reports/final.txt", "archive/final.txt")
+disk.move("reports/final.txt", "reports/archived.txt")
 ```
 
-Both operate **within** a single disk. On S3, `move` is implemented as copy-then-delete. To transfer between disks, read from one and write to the other:
+Both operate **within** a single disk. On the local driver, create the destination directory before moving a file into a new directory. On S3, `move` is implemented as copy-then-delete. To transfer between disks, read from one and write to the other:
 
 ```python
 data = Storage.disk("local").get_bytes("exports/data.csv")
+if data is None:
+    raise FileNotFoundError("exports/data.csv")
 Storage.disk("s3").put("exports/data.csv", data)
 ```
 
@@ -143,7 +157,9 @@ For serving or validating uploads, `alata.utils.filesystem.mime_type` sniffs a M
 ```python
 from alata.utils.filesystem import mime_type
 
-kind = mime_type(disk.get_bytes("uploads/file.bin"))  # e.g. "image/png"
+data = disk.get_bytes("uploads/file.bin")
+if data is not None:
+    kind = mime_type(data)  # e.g. "image/png"
 ```
 
 ## Async usage
@@ -195,12 +211,18 @@ disk.put("reports/2026/../2025/summary.txt", data)  # fine — still inside the 
 ```
 
 <Callout type="warn">
-This makes user-supplied keys — an upload filename, a path from a request — safe to pass through, but the confinement is per **disk**, not per user. A key is still free to overwrite any other file on the same disk, so keep tenant or user prefixes in the key yourself.
+Path checks confine keys to a disk; they do not authorize access to individual files. Generate upload keys and enforce ownership before reading, replacing, or deleting user files.
 </Callout>
 
 ## The S3 driver
 
-The `s3` driver builds its boto3 client lazily, on first use, from the disk's own options:
+Install the S3 extra, then configure a disk:
+
+```bash
+uv add "alata[s3]"
+```
+
+The `s3` driver uses these options:
 
 | Option | Meaning |
 | --- | --- |
@@ -211,7 +233,7 @@ The `s3` driver builds its boto3 client lazily, on first use, from the disk's ow
 | `endpoint` | Optional endpoint URL — point it at MinIO, LocalStack, or another S3-compatible store. |
 | `use_path_style` | Use path-style addressing instead of virtual-hosted (required by many S3-compatible stores). |
 
-Because credentials live per disk, two disks can target different buckets, regions, or even different accounts. Each disk caches its session **per thread** — boto3 sessions are not thread-safe, and the async twins run driver calls on worker threads — keyed by the connection options it was built from (credentials, region, endpoint, addressing style), so changing any of them discards the cached session rather than reusing one built for a different account. `boto3` is an optional dependency — the driver raises a clear `ModuleNotFoundError` telling you to install it if it's missing.
+Each disk can target a different bucket, region, or AWS account.
 
 <Callout type="info">
 S3 "not found" responses (404 / NoSuchKey) are translated to the same conventions as the local driver — `get` and `get_bytes` return `None`, `exists` returns `False`. Any other AWS error propagates as an exception.

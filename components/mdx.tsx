@@ -3,10 +3,12 @@ import { Step, Steps } from 'fumadocs-ui/components/steps';
 import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 import { Mermaid } from '@/components/mdx/mermaid';
 import type { MDXComponents } from 'mdx/types';
+import Link from 'next/link';
 
 export function getMDXComponents(components?: MDXComponents) {
   return {
     ...defaultMdxComponents,
+    Link,
     Step,
     Steps,
     Tab,

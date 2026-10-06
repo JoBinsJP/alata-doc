@@ -12,7 +12,7 @@ A scaffolded Alata project has a deliberate layout: your code lives in `app/`, t
 my-app/
 ├── alata                     # console entry point — ./alata <command>
 ├── main.py                   # uvicorn entry point — main:app
-├── Makefile                  # developer commands (serve, migrate, worker, test, ...)
+├── Makefile                  # environment tasks (install, test, lint, clean)
 ├── pyproject.toml
 ├── .env.example
 ├── app/
@@ -41,14 +41,17 @@ my-app/
 │   ├── queue.py              # taskiq broker + retry settings, queue names
 │   ├── redis.py              # named Redis connections
 │   ├── cache.py              # cache store + key prefix
+│   ├── rate_limit.py         # named rate limiters
 │   ├── filesystem.py         # storage disks (local, s3)
 │   └── middleware.py         # CORS, gzip, trusted hosts, request logging, maintenance
 ├── database/
-│   └── migrations/           # timestamped schema migrations
+│   ├── migrations/           # timestamped schema migrations
+│   └── seeders/              # database seeders
 ├── routes/
-│   └── api.py                # route definitions (APIRouter)
+│   └── api.py                # route definitions (Router)
 ├── storage/
-│   ├── framework/            # runtime files (maintenance flag, local disk)
+│   ├── app/                  # default local storage disk
+│   ├── framework/            # file cache and maintenance flag
 │   └── logs/                 # daily-rotated application logs
 └── tests/
     └── test_api.py           # starter test hitting the welcome route
@@ -77,7 +80,7 @@ Everything you write lives here.
 - **`app/console/kernel.py`** — your `AppKernel` subclass of the console kernel. Register custom CLI commands in `register_user_commands()` and define the [scheduled tasks](/docs/digging-deeper/scheduling) in `schedule()`. The template already schedules `queue:prune-orphans` hourly.
 - **`app/events/`** — event listeners for the [event system](/docs/digging-deeper/events).
 - **`app/exceptions/handler.py`** — your `Handler` subclass of the framework's exception handler. Configure `dont_report` (exceptions that should not be logged) and register custom `renderable` / `reportable` callbacks. See [error handling](/docs/basics/error-handling).
-- **`app/http/`** — controllers, route dependencies, and middleware. The template ships a `WelcomeController`, an `IdentityMiddleware` that resolves the acting user from `X-User-Id` / `X-Guest-Id` headers, and `require_authenticated` / `get_user_id` dependencies.
+- **`app/http/`** — controllers, route dependencies, and middleware. The template ships a `WelcomeController`, an `IdentityMiddleware` that resolves the acting user from `X-User-Id` / `X-Guest-Id` headers, and `require_authenticated` / `get_user_id` dependencies. These are identity examples; add credential verification for authenticated routes.
 - **`app/models/`** — your [database models](/docs/database/models).
 - **`app/providers/`** — your [service providers](/docs/architecture/providers). `./alata make:provider` scaffolds one here and registers it for you. A `*_provider.py` file that exists here but is not declared in `bootstrap/providers.py` triggers a startup warning — providers are never auto-loaded.
 - **`app/services/`** — plain Python domain logic, typically bound into the container by a provider.
@@ -85,12 +88,12 @@ Everything you write lives here.
 
 ## `bootstrap/` — the kernel
 
-This directory holds the single application kernel that every process shares.
+This directory defines the kernel used by HTTP, console, and worker processes. Each process creates its own application and service instances.
 
 - **`application.py`** — constructs `Application(base_path=..., providers=[...])`. This is the one place the kernel is built; the console script, the ASGI entry point, and the worker broker all import it.
 - **`app.py`** — exposes `app = kernel.fastapi` so ASGI servers (`uvicorn bootstrap.app:app`) serve the same kernel.
 - **`broker.py`** — imports the application (booting it fully) and exposes `broker = app.make("queue.broker")` for the taskiq worker CLI. Workers therefore start with initialized database engines and every other registered service — no worker-specific boot code.
-- **`providers.py`** — the explicitly ordered provider lists: `FRAMEWORK_PROVIDERS` (redis, events, queue, cache, health, storage), `PROVIDERS` (yours), and `APP_KERNEL_PROVIDERS` (providers wired directly into `application.py`).
+- **`providers.py`** — the explicitly ordered provider lists: `FRAMEWORK_PROVIDERS` (Redis, events, queue, cache, rate limiting, health, storage, console), `PROVIDERS` (yours), and `APP_KERNEL_PROVIDERS` (providers wired directly into `application.py`).
 
 ## `config/` — configuration modules
 
@@ -98,19 +101,19 @@ Plain Python modules, one per concern, loaded into the config repository during 
 
 ## `database/`
 
-`database/migrations/` holds timestamped migration files (`2025_01_01_000000_create_users_table.py`). Generate new ones with `./alata make:migration` and run them with the [`./alata migrate` family](/docs/database/migrations). The template ships migrations for `users`, `job_batches`, and `failed_jobs`.
+`database/migrations/` holds timestamped migration files (`2025_01_01_000000_create_users_table.py`). Generate new ones with `./alata make:migration` and run them with the [`./alata migrate` family](/docs/database/migrations). The template ships six migrations: users, job batches, failed jobs, cache and cache locks, queued jobs, and job results. `database/seeders/` contains the starter `DatabaseSeeder`.
 
 ## `routes/`
 
-Route definitions, separated from controller logic. `routes/api.py` builds an `APIRouter` (the template uses an `/api/v1` prefix) and the HTTP provider includes it during boot. See [routing](/docs/basics/routing).
+Route definitions, separated from controller logic. `routes/api.py` builds an Alata `Router` (the template uses an `/api/v1` prefix) and the HTTP provider includes it during boot. See [routing](/docs/basics/routing).
 
 ## `storage/`
 
 Everything the application persists locally:
 
 - **`storage/app/`** — your files: the default local [filesystem disk](/docs/digging-deeper/storage) writes here.
-- **`storage/framework/`** — framework-owned artifacts: the file cache store (`storage/framework/cache`) and the maintenance-mode flag (`storage/framework/down`, managed by `./alata down` / `./alata up`).
-- **`storage/logs/`** — the `file` log channel writes daily-rotated files here (`app-2026-07-28.log`).
+- **`storage/framework/`** — framework-owned artifacts: the file cache store (`storage/framework/cache/data`) and the maintenance-mode flag (`storage/framework/down`, managed by `./alata down` / `./alata up`).
+- **`storage/logs/`** — the `file` log channel writes daily-rotated files here (for example, `app-2026-10-06.log`).
 
 Runtime contents are gitignored; the directory skeleton ships via `.gitkeep` files.
 

@@ -1,6 +1,6 @@
 ---
 title: Cache
-description: A Redis-backed cache facade with TTLs, atomic locks, cache-aside helpers, and graceful degradation.
+description: File, Redis, database, and memory caching with TTLs, locks, and cache-aside helpers.
 icon: Gauge
 ---
 
@@ -59,7 +59,7 @@ cache can never release a held lock.
 
 The scaffold ships a `create_cache_table` migration that creates both
 tables (`alata_cache`: key, value, expiration; `alata_cache_locks`: key, owner,
-expiration) — `alata migrate` picks it up like any other migration. If you
+expiration) — `./alata migrate` picks it up like any other migration. If you
 configure a custom `table` name, rename the tables in that migration to
 match. On MySQL the migration also pins the `key` column to the
 `utf8mb4_bin` collation, so keys compare byte-for-byte the way they do on
@@ -82,7 +82,7 @@ or widen the column in your migration and raise
 `DatabaseCacheStore.KEY_MAX_LENGTH` to match.
 </Callout>
 
-At boot, `CacheProvider` builds the configured store and binds it in the [service container](/docs/architecture/container) as `cache`. The Redis store is handed *resolvers* for two container bindings: the sync client `redis.cache` and the async client `redis.cache.async` — both registered by the Redis provider from your `config/redis.py` (see [Named Redis connections](#named-redis-connections)). It also resolves a dedicated `redis.lock` connection so lock traffic never competes with cache traffic; if you haven't configured one, locks share the cache connection.
+`CacheProvider` registers the default store as `cache` in the [service container](/docs/architecture/container). Stores are created on first use. A Redis store uses its configured named connection from `config/redis.py` (see [Named Redis connections](#named-redis-connections)).
 
 <Callout type="info">
 The cache degrades gracefully. If Redis is unreachable — at boot or mid-flight — reads return `None` and writes are silent no-ops. The degradation is deliberate but never silent: the first failure is logged at **WARNING** (once per store), the rest at debug. Clients are re-resolved on every operation, so the cache starts working again on its own once Redis recovers — no restart, and no process stuck with rate limiting permanently off. The provider falls back to a no-op store only when *no* Redis connection is registered at all, which is a configuration fact rather than an outage.
@@ -142,6 +142,7 @@ seconds; an existing key keeps its original expiry, so increments never
 extend the window — which is what makes fixed-window counting correct.
 
 ```python
+store = Cache.store("file")
 attempts = await store.aincrement("login:u1", 1, ttl=60)
 ```
 
@@ -182,7 +183,7 @@ When a global key prefix is configured, `flush` deletes only your app's prefixed
 
 ### Atomic locks
 
-`Cache.alock` acquires a distributed lock atomically (SET NX EX) and returns an **owner token**, or `None` if the lock is already held. Pass the token back to `aunlock` so you only ever release your own lock — the release is an atomic compare-and-delete, immune to the race where your TTL expires and another process acquires the lock between check and delete:
+`Cache.alock` acquires a lock in the selected store and returns an **owner token**, or `None` if the lock is already held. Pass the token back to `aunlock` so you only ever release your own lock — the release is an atomic compare-and-delete, immune to the race where your TTL expires and another process acquires the lock between check and delete:
 
 ```python
 token = await Cache.alock("reports:rebuild", ttl=60)
@@ -199,11 +200,11 @@ Sync contexts use the plain `Cache.lock` / `Cache.unlock` pair — same semantic
 
 Locks are namespaced apart from values on **every** driver — a `lock:` sub-namespace under the global prefix on Redis, a table of their own on the memory store, separate `locks/` files on the file store, and the companion `{table}_locks` table on the database store. A lock and a cache value under the same logical key are different entries that never interact: writing or forgetting the value cannot release the lock, holding the lock never shadows the value, and `flush`/`forget_by_prefix` operate on values only.
 
-The `strict_locking` config key decides what happens when Redis is unavailable: with `True` (the default) `lock` returns `None` — acquisition fails, so uncoordinated concurrent execution is impossible; with `False` it returns a synthetic token and lets the operation proceed, which suits idempotent work like scheduling mutexes.
+The `strict_locking` config key decides what happens when Redis is unavailable: with `True` (the default) `lock` returns `None` — acquisition fails, so the protected operation can be skipped; with `False` it returns a synthetic token and lets the operation proceed without mutual exclusion.
 
 ### Sync usage
 
-For code that runs outside an event loop — [console commands](/docs/digging-deeper/console), migrations, scripts — call the plain names, backed by the sync Redis client. Drop the `a` prefix and the `await`:
+For code that runs outside an event loop — [console commands](/docs/digging-deeper/console), migrations, scripts — call the plain names, using the selected cache store. Drop the `a` prefix and the `await`:
 
 ```python
 value = Cache.get("key")
@@ -217,7 +218,7 @@ Cache.forget_by_prefix("dashboard:")
 
 ### Named stores
 
-`Cache.store(name)` resolves an alternative store registered in the container under `cache.<name>`. The framework registers `cache.null` (a no-op store) out of the box; bind your own in a provider to add more. Requesting an unregistered name raises `CacheStoreNotConfiguredError`, whose message lists the stores that *are* available.
+`Cache.store(name)` selects a store from `CACHE_CONFIG["stores"]`. Add another entry there to configure a named store; no extra provider is needed. An explicit container binding under `cache.<name>` takes precedence. Unknown names raise `CacheStoreNotConfiguredError`.
 
 ```python
 store = Cache.store("null")
@@ -262,7 +263,7 @@ CONNECTIONS = {
 }
 ```
 
-For each entry, `RedisProvider` registers two lazy container singletons:
+For each entry with a non-empty URL, `RedisProvider` registers two lazy container singletons:
 
 - `redis.<name>` — a sync client (`decode_responses=True`), pinged at first resolution; resolves to `None` if Redis is unreachable. The ping is bounded (3s connect, 5s operation), so a host that drops packets rather than refusing them fails fast instead of stalling startup.
 - `redis.<name>.async` — an async client that connects lazily on first command.
@@ -276,4 +277,4 @@ await redis.sadd("online", user_id)
 
 Connections that share a URL are **deduplicated**: when `REDIS_CACHE_URL` is unset and falls back to `REDIS_URL`, `redis.cache` is an alias for the same physical client as `redis.default` — no wasted connections. On application shutdown the provider closes every client that was actually resolved.
 
-Add your own entries — for example a dedicated `"lock"` connection, which the cache provider picks up automatically for lock traffic — and they become `redis.lock` / `redis.lock.async` with no further wiring.
+Add another named entry to make it available as `redis.<name>` and `redis.<name>.async`.

@@ -156,7 +156,7 @@ class SendShipmentNotification(Listener, ShouldQueue):
         return (send_shipment_email_task, (event.order.id,), {})
 ```
 
-`queue_via()` returns a `(task, args, kwargs)` tuple — the registered queue task to dispatch and the **serializable** arguments to pass it. The dispatcher pushes the message to the broker immediately and moves on; the listener body never runs in-process.
+`queue_via()` returns a `(task, args, kwargs)` tuple — the registered queue task to dispatch and the **serializable** arguments to pass it. The dispatcher calls the task through the configured broker instead of calling `handle()`. External queue connections enqueue it; the `sync` connection executes the task inline.
 
 <Callout type="warn">
 There is deliberately no automatic serialization of event objects — events often hold live model instances with session state that cannot survive a trip through the broker. Pass primitive identifiers (like `event.order.id`) and reload the model inside the task.
@@ -169,12 +169,13 @@ If the broker rejects the message (for example, Redis is down), the exception pr
 The ORM fires a generic `ModelEvent` through the event bus after every model mutation — `created`, `updated`, `saved`, and `deleted`. Listen for it to react to database changes anywhere in your app:
 
 ```python
+from alata.cache import Cache
 from alata.events.model_event import ModelEvent
 
 
 async def invalidate_cache(event: ModelEvent) -> None:
     if event.model_class == "User":       # class name of the mutated model
-        await cache.forget(f"user:{event.model.id}")
+        await Cache.aforget(f"user:{event.model.id}")
 
 dispatcher.listen(ModelEvent, invalidate_cache)
 ```
@@ -195,7 +196,7 @@ Swap the real dispatcher for a fake that records events without executing listen
 from alata.events.facade import Event
 
 
-async def test_shipping_dispatches_event():
+async def test_shipping_dispatches_event(fresh_container):
     fake = Event.fake()
 
     await ship_order(order)
@@ -206,4 +207,4 @@ async def test_shipping_dispatches_event():
     fake.assert_not_dispatched(OrderCancelled)
 ```
 
-The fake also offers `assert_dispatched_concurrently(...)` to verify the `concurrent=True` path and `reset()` to clear recorded events between assertions. For lower-level tests you can construct a `Dispatcher` directly, and `dispatcher.forget(EventClass)` / `dispatcher.flush()` remove listeners for isolation — `flush()` is called automatically by `container.flush()` in the test lifecycle.
+The fake also offers `assert_dispatched_concurrently(...)` to verify the `concurrent=True` path and `reset()` to clear recorded events between assertions. For lower-level tests you can construct a `Dispatcher` directly, and `dispatcher.forget(EventClass)` / `dispatcher.flush()` remove listeners for isolation — use the [isolated container fixture](/docs/testing#the-conftest-pattern) so a fake is discarded after each test.

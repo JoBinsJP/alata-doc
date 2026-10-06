@@ -520,8 +520,10 @@ Both variants take the ordering column (default `"created_at"`); ties are broken
 `oldest_of_many()` is the mirror — the minimum instead of the maximum:
 
 ```python
-"first_message": HasMany("Message", "thread_id").oldest_of_many(),
-"top_message":   HasMany("Message", "thread_id").latest_of_many("score"),
+__relationships__ = {
+    "first_message": HasMany("Message", "thread_id").oldest_of_many(),
+    "top_message": HasMany("Message", "thread_id").latest_of_many("score"),
+}
 ```
 
 <Callout type="info">

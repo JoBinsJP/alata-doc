@@ -6,7 +6,7 @@ icon: Gauge
 
 Horizon gives your [queues](/docs/digging-deeper/queues) a real-time web dashboard and a production-grade process manager. Instead of starting bare workers, you start one Horizon master process that spawns, balances, and autoscales worker processes per queue — while the dashboard shows you every job as it moves through the system: pending, completed, silenced, and failed jobs with full tracebacks, batches, tag monitoring, and throughput/latency charts.
 
-Horizon ships as its own package, `taskiq-horizon`, and its control plane is Redis-backed: job state, metrics, workload, and supervisor commands all live in Redis.
+Horizon ships as its own package, `taskiq-horizon`, and requires Redis for job state, metrics, workload, and supervisor commands. Set a non-empty `REDIS_URL` and configure an external queue connection; `sync` and `null` have no queue for Horizon workers to consume.
 
 ## What You Get
 
@@ -122,7 +122,7 @@ Each supervisor manages one queue — or a comma-separated set of queues — wit
 | `min_processes` | `1` | Minimum worker processes for the supervisor. |
 | `max_processes` | `10` | Maximum worker processes for the supervisor. |
 | `memory` | `128` | Memory limit (MB) per worker process before it is recycled. |
-| `timeout` | `60` | Seconds a worker may run a job before being considered stuck. |
+| `timeout` | `60` | Grace period in seconds for workers to drain before forced termination; not a per-job execution timeout. |
 | `balance_cooldown` | `3` | Seconds between autoscaling adjustments. |
 | `balance_max_shift` | `1` | Maximum processes added/removed per adjustment. |
 | `auto_scale_by_num_jobs` | `False` | Scale on queue length instead of projected time-to-clear. |

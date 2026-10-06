@@ -124,10 +124,10 @@ async def whoami(request: Request):
 
 Middleware stores per-request values on `request.state`. Out of the box:
 
-- `request.state.request_id` — set by the request-logging [middleware](/docs/basics/middleware) (from the incoming `X-Request-ID` header, or generated), and echoed back on the response for tracing.
+- `request.state.request_id` — set by the request-logging [middleware](/docs/basics/middleware) (from the incoming `X-Request-ID` header, or generated), and echoed on responses except for paths excluded from request logging.
 - `request.state.user_id` — set by the scaffold's `IdentityMiddleware` from the `X-User-Id` / `X-Guest-Id` headers, falling back to `"anonymous"`.
 
-Prefer the dependencies in `app/http/dependencies.py` (`get_user_id`, `require_authenticated`) over reading `request.state` directly in handlers.
+The dependencies in `app/http/dependencies.py` expose this identity to handlers. The scaffold reads identity headers for demonstration; it does not verify credentials. Replace this with validated session or token authentication before using these helpers to protect routes.
 
 ## Request Context Outside the Request
 
@@ -140,27 +140,9 @@ from alata.context import user_id_context, request_context
 - `user_id_context: ContextVar[str | None]` — the acting user's id.
 - `request_context: ContextVar[dict | None]` — arbitrary per-request metadata.
 
-They default to `None`; your middleware populates them, and anything downstream can read them without an explicit parameter:
+They default to `None`. The scaffold's identity middleware sets `user_id_context` when an identity header is present and resets it after the request. Populate `request_context` yourself when you need additional metadata; see [request context](/docs/digging-deeper/context).
 
-```python title="app/http/middleware.py"
-from alata.context import user_id_context
-
-
-class IdentityMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        user_id = request.headers.get("X-User-Id")
-        request.state.user_id = user_id or "anonymous"  # state always has a value
-        if user_id is None:
-            return await call_next(request)  # context stays unset for anonymous callers
-
-        token = user_id_context.set(user_id)
-        try:
-            return await call_next(request)
-        finally:
-            user_id_context.reset(token)
-```
-
-Note the asymmetry: the `"anonymous"` fallback goes on `request.state` only, for display and logging. The context variable is set only for real identities — the [rate limiter](/docs/digging-deeper/rate-limiting) keys buckets on it, and a shared constant would put every anonymous caller into a single bucket.
+The `"anonymous"` fallback belongs on `request.state` only. Leaving `user_id_context` unset lets the [rate limiter](/docs/digging-deeper/rate-limiting) use the client's IP for anonymous requests.
 
 ```python title="app/services/audit.py"
 from alata.context import user_id_context

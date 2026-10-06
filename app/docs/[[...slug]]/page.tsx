@@ -5,13 +5,14 @@ import {
   DocsPage,
   DocsTitle,
   MarkdownCopyButton,
-  ViewOptionsPopover,
 } from 'fumadocs-ui/layouts/docs/page';
 import { notFound } from 'next/navigation';
 import { getMDXComponents } from '@/components/mdx';
 import type { Metadata } from 'next';
 import { createRelativeLink } from 'fumadocs-ui/mdx';
-import { gitConfig } from '@/lib/shared';
+import { docsGitConfig } from '@/lib/shared';
+import { publicUrl } from '@/lib/urls';
+import { PageOptions } from '@/components/page-options';
 
 export default async function Page(props: PageProps<'/docs/[[...slug]]'>) {
   const params = await props.params;
@@ -23,13 +24,14 @@ export default async function Page(props: PageProps<'/docs/[[...slug]]'>) {
 
   return (
     <DocsPage toc={page.data.toc} full={page.data.full}>
-      <DocsTitle>{page.data.title}</DocsTitle>
-      <DocsDescription className="mb-0">{page.data.description}</DocsDescription>
-      <div className="flex flex-row gap-2 items-center border-b pb-6">
-        <MarkdownCopyButton markdownUrl={markdownUrl} />
-        <ViewOptionsPopover
+      <DocsTitle className="docs-title">{page.data.title}</DocsTitle>
+      <DocsDescription className="docs-description">{page.data.description}</DocsDescription>
+      <div className="docs-actions">
+        <MarkdownCopyButton className="docs-action" markdownUrl={markdownUrl}>Copy page</MarkdownCopyButton>
+        <PageOptions
           markdownUrl={markdownUrl}
-          githubUrl={`https://github.com/${gitConfig.user}/${gitConfig.repo}/blob/${gitConfig.branch}/content/docs/${page.path}`}
+          pageUrl={publicUrl(page.url)}
+          githubUrl={`https://github.com/${docsGitConfig.user}/${docsGitConfig.repo}/blob/${docsGitConfig.branch}/content/docs/${page.path}`}
         />
       </div>
       <DocsBody>
@@ -56,6 +58,7 @@ export async function generateMetadata(props: PageProps<'/docs/[[...slug]]'>): P
   return {
     title: page.data.title,
     description: page.data.description,
+    alternates: { canonical: publicUrl(page.url) },
     openGraph: {
       images: getPageImage(page).url,
     },

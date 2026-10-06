@@ -64,7 +64,8 @@ DB_PASSWORD=secret
 The driver comes from `DB_CONNECTION`, which defaults to `pgsql` — an accepted alias for `postgres`, so a fresh project targets PostgreSQL without setting anything. To use another database, set it explicitly:
 
 ```bash title=".env"
-DB_CONNECTION=mysql   # or: postgres, pgsql, sqlite
+DB_CONNECTION=mysql
+DB_PORT=3306
 ```
 
 During boot, `CONNECTIONS` and `DB_CONFIG` are loaded into the config repository as `database.connections` and `database.config`, so any code can read them through the [service container](/docs/architecture/container):
@@ -340,13 +341,13 @@ For a quick look from the terminal, run:
 ./alata db:status
 ```
 
-It boots only the database layer (fast — no app providers) and renders each connection with a health badge, a visual capacity bar, and the full metric breakdown:
+It reports the pools in the CLI process, with a status label, capacity bar, and metric breakdown. For the running HTTP process, use [`/health/metrics`](/docs/digging-deeper/health#get-healthmetrics--pool-utilization):
 
 ```text
-  ⚡ Database Connection Pool Status
+  Database Connection Pool Status
 
   default  HEALTHY
-  ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  10.0%
+  ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  6.7%
 
     ├─ Pool Size     5 base + 10 overflow (max 15)
     ├─ Checked Out   1

@@ -55,7 +55,10 @@ This means the channel routing applies to loggers under the `app` and `alata` na
 
 `config/logging.py` defines a `LOG_CONFIG` dict: a default channel plus named channel definitions, all driven by environment variables via `config/settings.py`:
 
-```python title="config/logging.py"
+```python title="config/logging.py (example)"
+from config.settings import settings
+from alata.support.paths import base_path
+
 LOG_CONFIG = {
     "default": settings.LOG_CHANNEL,          # LOG_CHANNEL env, default "stack"
     "channels": {
@@ -67,13 +70,13 @@ LOG_CONFIG = {
         "console": {"driver": "console", "level": "DEBUG", "format": settings.LOG_FORMAT},
         "file": {
             "driver": "file",
-            "path": str(_LOG_DIR / "app.log"),
+            "path": str(base_path("storage", "logs", "app.log")),
             "rotation": "daily",
             "max_days": 14,
         },
         "json":   {"driver": "json"},
-        "sentry": {"driver": "sentry", "dsn": settings.SENTRY_DSN, ...},
-        "slack":  {"driver": "slack", "url": settings.LOG_SLACK_WEBHOOK_URL, ...},
+        "sentry": {"driver": "sentry", "dsn": settings.SENTRY_DSN, "enabled": settings.should_enable_sentry()},
+        "slack":  {"driver": "slack", "url": settings.LOG_SLACK_WEBHOOK_URL},
         "null":   {"driver": "null"},
     },
 }
@@ -146,13 +149,13 @@ Keep the Slack channel's `level` at `ERROR` or above, and don't put it in your d
 The `console` and `file` drivers accept a standard `logging` format string via the `format` key:
 
 ```python
-"format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+LOG_CONFIG["channels"]["console"]["format"] = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 ```
 
 Console, file, JSON, and Slack timestamps use `LOG_TIMEZONE`, falling back to `APP_TIMEZONE` (UTC by default). To use a different zone for one channel, give it a `timezone` (IANA name):
 
 ```python
-"json": {"driver": "json", "timezone": "Asia/Tokyo"},
+LOG_CONFIG["channels"]["json"] = {"driver": "json", "timezone": "Asia/Tokyo"}
 ```
 
 An unknown zone name fails channel creation. Plain-text and JSON timestamps include their UTC offset. Daily log files rotate at midnight in the file channel's timezone. See [dates and timezones](/docs/basics/dates-and-timezones) for application settings.

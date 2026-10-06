@@ -4,7 +4,7 @@ description: Which variant to call, and where — the event loop, the per-layer 
 icon: ArrowLeftRight
 ---
 
-Alata code runs in two worlds. Route handlers and queue tasks run on an event loop; console commands, migrations, and scripts do not. Because of that, most I/O APIs in the framework come in pairs — a sync form and an async twin. This page is the reference for which one to call in which context.
+Alata code runs in two worlds. Async route handlers and queue tasks run on an event loop; console commands, migrations, and scripts do not. Because of that, most I/O APIs in the framework come in pairs — a sync form and an async twin. This page is the reference for which one to call in which context.
 
 ## What async is
 
@@ -21,7 +21,7 @@ So async is about *waiting without blocking*, not about speed. An awaited query 
 
 ## The one rule
 
-**Never block the event loop.** Inside an async context — route handlers, queue tasks — call the async variants. The sync variants belong in synchronous contexts: console commands, migrations, scripts, and sync test helpers — [tests](/docs/testing) are `async def` by default and await the async variants directly.
+**Never block the event loop.** Inside an async context — route handlers, queue tasks — call the async variants. The sync variants belong in synchronous contexts: console commands, migrations, scripts, and sync test helpers — [async tests](/docs/testing) await the async variants directly.
 
 <Callout type="warn">
 A blocking call in a route handler does not just slow down that one request — it stalls **every** request on that worker. While a sync `Order.find(...)` waits on the database, the event loop cannot run, so nothing else on the process is served. Nothing raises; the symptom is whole-app latency under load, which makes this the most expensive mistake on this page.
@@ -42,13 +42,13 @@ The conventions differ per layer — this table is the reference:
 | [Rate limiter](/docs/digging-deeper/rate-limiting) | `attempt`, `hit`, `too_many_attempts`, `available_in`, `clear` | `aattempt`, `ahit`, `atoo_many_attempts`, `aavailable_in`, `aclear` |
 | [Cache](/docs/digging-deeper/cache) | `get`, `put`, `forget`, `has`, ... | `aget`, `aput`, `aforget`, `ahas`, ... |
 
-One rule, no exceptions: the plain name is sync, and prefixing `a` gives you the twin to `await`. A few helpers exist on one side only — the cache's `aremember` has no sync counterpart — but no name ever means different things in different layers.
+For the paired I/O APIs above, the plain name is sync and the `a` prefix selects the awaitable form. A few helpers exist on one side only — the cache's `aremember` has no sync counterpart — but no name ever means different things in different layers.
 
 ## Where you are async
 
 ### Route handlers
 
-Handlers run on the event loop, so this is async-variant territory:
+`async def` handlers run on the event loop and use async variants. FastAPI also accepts `def` handlers, which it runs in a thread pool:
 
 ```python title="routes/api.py"
 from alata.http import APIRouter
@@ -65,7 +65,7 @@ async def list_orders(page: int = 1):
 
 ### Queue tasks
 
-[Queue tasks](/docs/digging-deeper/queues) are async functions, and workers run them on an event loop too — same rule as handlers:
+[Queue tasks](/docs/digging-deeper/queues) may be sync or async. Use async variants inside an `async def` task:
 
 ```python title="app/tasks/report_tasks.py"
 from bootstrap.broker import broker
@@ -120,7 +120,11 @@ class PruneOrdersCommand(Command):
     async def handle_async(self) -> int:
         from app.models.order import Order
 
-        deleted = await Order.where("status", "cancelled").adelete()
+        from datetime import timedelta
+        from alata.support.dates import utc_now
+
+        cutoff = utc_now() - timedelta(days=90)
+        deleted = await Order.where("status", "cancelled").where("created_at", "<", cutoff).adelete()
         self.info(f"Pruned {deleted} order(s).")
         return 0
 ```
