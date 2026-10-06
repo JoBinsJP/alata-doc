@@ -334,6 +334,21 @@ async def test_signup_dispatches_welcome_email(booted_container):
 
 The same approach works for console commands: they are ordinary classes, so instantiate the command, stub out any collaborators through the container, and call its logic directly.
 
+## Testing Time-Dependent Code
+
+Use `freeze_time()` to give Alata date helpers, model timestamps, and scheduled tasks a predictable clock:
+
+```python
+from alata.support.dates import utc_now
+from alata.testing import freeze_time
+
+with freeze_time("2026-10-06T09:00:00+09:00"):
+    user = User.create({"name": "Bedu", "email": "bedu@example.com"})
+    assert user.created_at == utc_now()
+```
+
+The previous clock is restored when the block exits. Nested scopes and independently frozen async tasks are isolated. See [dates and timezones](/docs/basics/dates-and-timezones#freezing-time-in-tests) for the clock's scope.
+
 ## Running the Suite
 
 ```bash

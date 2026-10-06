@@ -149,13 +149,13 @@ The `console` and `file` drivers accept a standard `logging` format string via t
 "format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 ```
 
-Timestamps in JSON (and Slack's time field) default to UTC with an explicit offset — log viewers re-render them locally. To bake a local zone into the payload itself, give the channel a `timezone` (IANA name):
+Console, file, JSON, and Slack timestamps use `LOG_TIMEZONE`, falling back to `APP_TIMEZONE` (UTC by default). To use a different zone for one channel, give it a `timezone` (IANA name):
 
 ```python
 "json": {"driver": "json", "timezone": "Asia/Tokyo"},
 ```
 
-An unknown zone name fails the channel build loudly. Plain-text channels (`console`, `file`) follow the process timezone instead — set the `TZ` environment variable.
+An unknown zone name fails channel creation. Plain-text and JSON timestamps include their UTC offset. Daily log files rotate at midnight in the file channel's timezone. See [dates and timezones](/docs/basics/dates-and-timezones) for application settings.
 
 Setting the console channel's `format` to the literal string `"json"` switches it to the structured JSON formatter. The `json` driver (and Slack's internal detail formatting) emits records as:
 

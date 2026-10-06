@@ -157,11 +157,15 @@ Sub-minute events combine with `on_one_server()`: the server claim is taken **on
 
 ### Timezone
 
-Cron expressions are evaluated in UTC by default. `timezone()` switches evaluation to any IANA timezone:
+Schedules use `SCHEDULE_TIMEZONE`, falling back to `APP_TIMEZONE` (UTC by default). `timezone()` overrides that default for one task:
 
 ```python
 schedule.command("report:send").daily_at("09:00").timezone("Asia/Tokyo")
 ```
+
+This timezone also controls weekday constraints, `between()`, `unless_between()`, and `last_day_of_month()`. The last day is evaluated for each month, including leap years. `schedule:list` converts the next occurrence to UTC and displays the effective timezone beside it.
+
+At daylight-saving changes, a local time that does not exist is skipped; a time that occurs twice can run twice. Use UTC schedules or make the job idempotent when repeated local times matter. See [dates and timezones](/docs/basics/dates-and-timezones) for configuration and testing helpers.
 
 ### Environments
 

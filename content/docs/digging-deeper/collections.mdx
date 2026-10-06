@@ -221,7 +221,7 @@ These are the only collection methods that touch the database, and they work **o
 | --- | --- |
 | `all()` / `to_list()` | The items as a plain `list`. |
 | `to_dict()` | Call `.to_dict()` on each item (model instances); items without one pass through unchanged. |
-| `to_json(**kwargs)` | JSON string via `to_dict()`; `datetime` and `date` values are ISO-formatted. Extra kwargs go to `json.dumps` (e.g. `indent=2`). |
+| `to_json(**kwargs)` | JSON string via `to_dict()`; datetimes use UTC ISO-8601 with `Z`, and dates use `YYYY-MM-DD`, including nested values. Extra kwargs go to `json.dumps` (e.g. `indent=2`). |
 
 ```python
 payload = (await User.aall()).to_json(indent=2)

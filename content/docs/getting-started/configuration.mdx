@@ -199,6 +199,17 @@ env("WORKER_COUNT", 4)      # "8" in the environment → int 8
 env("FEATURE_FLAG", False)  # "true" → True
 ```
 
+## Application timezone
+
+`APP_TIMEZONE` sets the default timezone for date helpers, schedules, and logs. It defaults to `UTC`. Use `SCHEDULE_TIMEZONE` or `LOG_TIMEZONE` when either needs a different default:
+
+```dotenv title=".env"
+APP_TIMEZONE=UTC
+SCHEDULE_TIMEZONE=Asia/Tokyo
+```
+
+The corresponding repository keys are `app.timezone`, `app.schedule_timezone`, and `app.log_timezone`. See [dates and timezones](/docs/basics/dates-and-timezones) for conversion helpers, model timestamps, and upgrading an existing Settings class.
+
 ## Maintenance mode configuration
 
 Two settings control [maintenance mode](/docs/getting-started/deployment#maintenance-mode) behavior:

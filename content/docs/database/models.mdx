@@ -72,7 +72,7 @@ class Post(Model):
 
 Every model automatically has `created_at` and `updated_at` columns. `created_at` is set when a row is inserted and `updated_at` refreshes on every update — you never manage them by hand. The [`timestamps()` blueprint method](/docs/database/migrations#timestamps-and-soft-deletes) creates the matching columns in your migrations.
 
-Timestamps are **always timezone-aware UTC datetimes**, on every supported database. The columns use a timezone-preserving type that adapts to the dialect: on PostgreSQL it is a native `TIMESTAMP WITH TIME ZONE`, passed through untouched; on MySQL — whose `DATETIME` discards timezone information — values are normalized to UTC before writing and re-tagged as UTC when read back, stored as `DATETIME(6)` so microsecond precision matches. Your application code never sees a naive datetime from a model timestamp, regardless of which database is behind it. The same type backs the `deleted_at` column used by [soft deletes](#soft-deletes) and the `dt_col()` helper.
+Model timestamps are stored and returned as **timezone-aware UTC datetimes**, including `deleted_at` and values declared with `dt_col()`. Use [date helpers](/docs/basics/dates-and-timezones) to display them in your application's timezone.
 
 ### Primary keys
 
@@ -361,7 +361,7 @@ class User(Model):
         return self.name.title()
 
 user.to_dict()   # {"id": 1, "name": ..., "display_name": ...} — no password_hash
-user.to_json()   # JSON string; datetimes serialized as ISO-8601
+user.to_json()   # JSON string; datetimes serialized in UTC with a Z suffix
 ```
 
 - `__hidden__` — columns excluded from the output.

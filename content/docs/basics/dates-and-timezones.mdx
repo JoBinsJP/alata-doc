@@ -1,0 +1,98 @@
+---
+title: Dates and Timezones
+description: Configure application time, convert dates, and test time-dependent behavior.
+icon: Clock
+---
+
+## Choosing a timezone
+
+Set the timezone your application's dates and business schedules should use:
+
+```dotenv title=".env"
+APP_TIMEZONE=Asia/Tokyo
+```
+
+Use an IANA name such as `Asia/Tokyo`, `America/New_York`, or `UTC`. Invalid names fail application startup with the setting named in the error.
+
+| Setting | Default | Controls |
+| --- | --- | --- |
+| `APP_TIMEZONE` | `UTC` | Date helpers and the default zone for schedules and logs |
+| `SCHEDULE_TIMEZONE` | Inherits `APP_TIMEZONE` | Scheduled tasks without their own timezone |
+| `LOG_TIMEZONE` | Inherits `APP_TIMEZONE` | Log channels without their own timezone |
+
+For example, keep application and log timestamps in UTC while running business schedules in Tokyo:
+
+```dotenv title=".env"
+APP_TIMEZONE=UTC
+SCHEDULE_TIMEZONE=Asia/Tokyo
+```
+
+New projects include these fields in `config/settings.py`. When upgrading an existing application, add them to its `Settings` class before setting them in `.env`:
+
+```python title="config/settings.py"
+APP_TIMEZONE: str = "UTC"
+SCHEDULE_TIMEZONE: str | None = None
+LOG_TIMEZONE: str | None = None
+```
+
+## Reading and converting dates
+
+```python
+from alata.support.dates import now, today, to_timezone, to_utc, to_iso8601, utc_now
+
+now()                          # aware datetime in APP_TIMEZONE
+today()                        # calendar date in APP_TIMEZONE
+now("America/New_York")        # explicit timezone
+utc_now()                      # aware UTC datetime
+to_timezone(order.created_at)  # display in APP_TIMEZONE
+to_timezone(order.created_at, "Asia/Tokyo")
+to_utc(order.created_at)
+to_iso8601(order.created_at)    # e.g. "2026-10-06T00:00:00Z"
+```
+
+For local user input, include its offset or attach its intended timezone before converting:
+
+```python
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+appointment = datetime(2026, 10, 6, 9, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+to_iso8601(appointment)  # "2026-10-06T00:00:00Z"
+```
+
+Datetime values without an offset are interpreted as UTC by these helpers and timezone-aware model columns. Plain calendar dates, such as birthdays, remain dates and are not shifted between timezones.
+
+## Storage and JSON
+
+Changing `APP_TIMEZONE` changes how application time is read and displayed. Model timestamps and `dt_col()` values are stored and returned in UTC on PostgreSQL, MySQL, and SQLite. Framework-managed PostgreSQL and MySQL connections also use UTC for SQL-generated timestamps.
+
+`Model.to_json()` and `Collection.to_json()` serialize datetimes as UTC ISO-8601 strings ending in `Z`, including dates inside nested objects and lists. Calendar dates serialize as `YYYY-MM-DD`. Use `to_iso8601()` when constructing an API payload that needs the same format.
+
+Existing data is not rewritten when you change timezone settings. If an older application stored local times without offsets, convert that data explicitly before treating it as UTC.
+
+## Schedules and logs
+
+An individual schedule can override the default:
+
+```python
+schedule.command("report:send").daily_at("09:00").timezone("Asia/Tokyo")
+```
+
+`between()`, `unless_between()`, weekday constraints, and month boundaries follow the schedule's timezone. `schedule:list` shows each effective timezone and the next occurrence in UTC. See [task scheduling](/docs/digging-deeper/scheduling#timezone) for daylight-saving behavior.
+
+Log channels can override `LOG_TIMEZONE` with a `timezone` option. Plain-text console, file, JSON, and Slack timestamps follow the same precedence; daily files rotate at midnight in the file channel's timezone. See [logging](/docs/basics/logging#formatting).
+
+## Freezing time in tests
+
+```python
+from alata.support.dates import now, utc_now
+from alata.testing import freeze_time
+
+def test_order_timestamp():
+    with freeze_time("2026-10-06T09:00:00+09:00"):
+        order = Order.create({"status": "pending"})
+        assert order.created_at == utc_now()
+        assert now("Asia/Tokyo").hour == 9
+```
+
+The clock is restored on exit, including when the test raises. Nested scopes and independently frozen async tasks remain isolated. Freezing affects Alata date helpers, model-generated timestamps, and scheduler evaluation; Python's own `datetime.now()`, database-generated timestamps, timers, and external worker processes keep their real clocks.
