@@ -4,7 +4,7 @@ description: Run built-in framework commands and write your own with the ./alata
 icon: SquareTerminal
 ---
 
-Every Alata project ships with `./alata`, a command-line interface at the root of your application. It runs the same kernel as your HTTP server — the same providers register, the same container bindings resolve — so anything your app can do, a console command can do too. The console layer is built on cleo, so you get argument parsing, styled output, and auto-generated help for free.
+Every Alata project ships with `./alata`, a command-line interface for setup, development, and running your application. Application commands share the same kernel, providers, and container as your HTTP server.
 
 ## Running commands
 
@@ -20,11 +20,42 @@ Get help for a specific command, including its arguments and options:
 ./alata help migrate
 ```
 
-Every command also accepts a few global options: `-h/--help`, `-q/--quiet`, `-V/--version`, `-n/--no-interaction`, and `-v`/`-vv`/`-vvv` for increasing verbosity.
+Application commands accept global options: `-h/--help`, `-q/--quiet`, `-V/--version`, `-n/--no-interaction`, and `-v`/`-vv`/`-vvv` for increasing verbosity. Development commands accept their underlying tool's options, described below.
 
 <Callout type="info">
 The `./alata` script automatically re-executes itself with your project's `.venv` Python if the virtualenv is not active — you never need to `source .venv/bin/activate` first.
 </Callout>
+
+## Development commands
+
+Install dependencies and run your daily checks from the project console:
+
+```bash
+./alata setup
+./alata test
+./alata lint
+./alata format
+```
+
+`setup` uses uv to install the project's dependencies, including the development group. `test` runs pytest; `lint` and `format` use Ruff. Pass options and paths directly:
+
+```bash
+./alata setup --locked
+./alata test tests/test_users.py -v
+./alata test -k "signup and not slow"
+./alata lint app/ --fix
+./alata format --check
+```
+
+Use `./alata help test` or `./alata test --help` to see pytest's options; the same pattern works for the other development commands. Failures return a nonzero exit status, so these commands also work in CI.
+
+`./alata clean` removes Python bytecode and pytest, Ruff, and mypy caches. It preserves application storage and virtual environments. To manage application cache entries, use the [cache API](/docs/digging-deeper/cache).
+
+For adding or upgrading packages, use uv directly, for example `uv add httpx` or `uv lock --upgrade-package httpx`.
+
+### Upgrading an existing project
+
+Projects created before v0.11.0.2 need the updated root `alata` launcher and `bootstrap/console.py` from the new project template. Preserve any custom launcher changes, add `ruff>=0.16.0` to the `dev` dependency group, and run `./alata setup` after updating the framework dependency. You can remove the old Makefile once any custom targets have been accounted for.
 
 ## Built-in commands
 
@@ -34,6 +65,11 @@ The framework registers this command set out of the box:
 | --- | --- |
 | `list` | List all available commands. |
 | `help <command>` | Display help for a command. |
+| `setup` | Install project dependencies with uv. |
+| `test` | Run pytest, with optional paths and pytest arguments. |
+| `lint` | Check code with Ruff; pass `--fix` to apply fixes. |
+| `format` | Format code with Ruff; pass `--check` to check without writing. |
+| `clean` | Remove development caches. |
 | `serve` | Start the HTTP server (`--host`, `--port`, `--workers`, `--no-reload`). |
 | `migrate` | Run all pending database migrations. |
 | `migrate:rollback` | Roll back the last batch of migrations. |
@@ -186,7 +222,7 @@ class ProjectQueueWorkCommand(QueueWorkCommand):
 
 ## Choosing an environment
 
-Select an environment-specific configuration file with the global `--env` flag:
+Select an environment-specific configuration file for application commands with the global `--env` flag:
 
 ```bash
 ./alata migrate --env testing

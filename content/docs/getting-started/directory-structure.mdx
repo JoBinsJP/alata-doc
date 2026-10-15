@@ -12,7 +12,6 @@ A scaffolded Alata project has a deliberate layout: your code lives in `app/`, t
 my-app/
 ├── alata                     # console entry point — ./alata <command>
 ├── main.py                   # uvicorn entry point — main:app
-├── Makefile                  # environment tasks (install, test, lint, clean)
 ├── pyproject.toml
 ├── .env.example
 ├── app/
@@ -30,6 +29,7 @@ my-app/
 │   ├── services/             # domain / business logic
 │   └── tasks/                # queue task definitions
 ├── bootstrap/
+│   ├── console.py            # project console startup
 │   ├── application.py        # builds the ONE application kernel
 │   ├── app.py                # exposes the FastAPI instance for ASGI servers
 │   ├── broker.py             # exposes the taskiq broker for workers
@@ -61,17 +61,13 @@ my-app/
 
 ### `alata`
 
-The console entry point. `./alata <command>` boots the application kernel from `bootstrap/application.py` and hands off to the console kernel, which registers the full command set — `migrate`, `make:*`, `queue:*`, `schedule:*`, `serve`, `down`/`up`, and any commands your providers add. Run `./alata list` to see everything.
+The project console. Use `./alata setup`, `./alata test`, `./alata lint`, and `./alata format` for development, and `./alata serve`, `./alata migrate`, `./alata queue:work`, and other framework commands to run your application. Run `./alata list` to see the full command set, including commands your providers add.
 
 The script auto-detects `.venv/bin/python` and re-executes itself with it, so it works without activating the virtualenv.
 
 ### `main.py`
 
 A thin uvicorn entry point that imports the FastAPI app from `bootstrap/app.py`. `python main.py` starts a reloading dev server; deployment tools can target `main:app` or `bootstrap.app:app` interchangeably.
-
-### `Makefile`
-
-Environment tasks only: `make install`, `make test`, `make lint`, `make clean`. Everything runtime — serving, migrations, workers, maintenance mode — lives on the application console; run `./alata list` to see it all.
 
 ## `app/` — your application
 
@@ -92,6 +88,7 @@ This directory defines the kernel used by HTTP, console, and worker processes. E
 
 - **`application.py`** — constructs `Application(base_path=..., providers=[...])`. This is the one place the kernel is built; the console script, the ASGI entry point, and the worker broker all import it.
 - **`app.py`** — exposes `app = kernel.fastapi` so ASGI servers (`uvicorn bootstrap.app:app`) serve the same kernel.
+- **`console.py`** — starts the project console, including first-time setup and virtual environment selection.
 - **`broker.py`** — imports the application (booting it fully) and exposes `broker = app.make("queue.broker")` for the taskiq worker CLI. Workers therefore start with initialized database engines and every other registered service — no worker-specific boot code.
 - **`providers.py`** — the explicitly ordered provider lists: `FRAMEWORK_PROVIDERS` (Redis, events, queue, cache, rate limiting, health, storage, console), `PROVIDERS` (yours), and `APP_KERNEL_PROVIDERS` (providers wired directly into `application.py`).
 

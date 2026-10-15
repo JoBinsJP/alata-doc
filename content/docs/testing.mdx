@@ -16,6 +16,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.25.0",
     "httpx>=0.28.0",
+    "ruff>=0.16.0",
 ]
 ```
 
@@ -362,9 +363,9 @@ The previous clock is restored when the block exits. Nested scopes and independe
 ## Running the Suite
 
 ```bash
-uv run pytest                 # the whole suite
-uv run pytest tests/test_users.py -v
-uv run pytest -k "signup"     # by keyword
+./alata test                 # the whole suite
+./alata test tests/test_users.py -v
+./alata test -k "signup"      # by keyword
 ```
 
 <Callout type="info">

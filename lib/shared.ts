@@ -1,5 +1,5 @@
 export const appName = 'Alata';
-export const frameworkVersion = '0.11.0.1';
+export const frameworkVersion = '0.11.0.2';
 export const docsRoute = '/docs';
 export const docsImageRoute = '/og/docs';
 export const docsContentRoute = '/llms.mdx/docs';
