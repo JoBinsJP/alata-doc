@@ -8,6 +8,8 @@ A typical Alata deployment runs an ASGI server, queue workers, and a cron-driven
 
 ## One kernel, every process
 
+Run commands in your application's Python environment. For a process manager, configure that environment's Python executable or its `bin` directory on `PATH`.
+
 `bootstrap/application.py` builds the single `Application` for your project. Each entry point is a thin view over it:
 
 | Process | Entry point | Loads |
@@ -69,10 +71,10 @@ Either way, the target is `bootstrap.broker:broker` — the broker resolved from
 Add a single cron entry on one machine (or a dedicated scheduler container) that ticks every minute:
 
 ```bash
-* * * * * cd /path/to/app && ./alata schedule:run >> /dev/null 2>&1
+* * * * * cd /path/to/app && /path/to/app/.venv/bin/python alata schedule:run >> /dev/null 2>&1
 ```
 
-`schedule:run` evaluates the schedule defined in `app/console/kernel.py` and fires whatever is due. Use `on_one_server()` on events if you run the cron entry on multiple machines — see [scheduling](/docs/digging-deeper/scheduling).
+Use the absolute path to the Python environment where your application's dependencies are installed. `schedule:run` evaluates the schedule defined in `app/console/kernel.py` and fires whatever is due. Use `on_one_server()` on events if you run the cron entry on multiple machines — see [scheduling](/docs/digging-deeper/scheduling).
 
 ## Pinning the framework version
 
@@ -86,7 +88,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-alata = { git = "ssh://git@github.com/JoBinsJP/alata-core.git", tag = "v0.11.0.2" }
+alata = { git = "ssh://git@github.com/JoBinsJP/alata-core.git", tag = "v0.12.0.0" }
 ```
 
 Then `uv sync` in your build step produces the same framework version every time. Upgrading is a one-line tag bump. The repository is private — your build environment needs SSH access to it.

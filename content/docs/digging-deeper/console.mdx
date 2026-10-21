@@ -8,6 +8,12 @@ Every Alata project ships with `./alata`, a command-line interface for setup, de
 
 ## Running commands
 
+Activate your Python environment before running console commands. For the default environment created by `./alata setup`:
+
+```bash
+source .venv/bin/activate
+```
+
 List every available command:
 
 ```bash
@@ -22,9 +28,19 @@ Get help for a specific command, including its arguments and options:
 
 Application commands accept global options: `-h/--help`, `-q/--quiet`, `-V/--version`, `-n/--no-interaction`, and `-v`/`-vv`/`-vvv` for increasing verbosity. Development commands accept their underlying tool's options, described below.
 
-<Callout type="info">
-The `./alata` script automatically re-executes itself with your project's `.venv` Python if the virtualenv is not active — you never need to `source .venv/bin/activate` first.
-</Callout>
+Every `./alata` example also works with `python alata`. Run it from your application's root directory using your environment's Python:
+
+```bash
+python alata make:migration create_users_table
+```
+
+The syntax is `python alata <command> [arguments]`. Here, `alata` is the project console file and `make:migration` is the command name. Both forms accept the same commands, arguments, and options, including `python alata setup` and `python alata test`.
+
+Without activation, use `uv run ./alata <command>` or `uv run python alata <command>`:
+
+```bash
+uv run python alata migrate
+```
 
 ## Development commands
 
@@ -32,12 +48,13 @@ Install dependencies and run your daily checks from the project console:
 
 ```bash
 ./alata setup
+source .venv/bin/activate
 ./alata test
 ./alata lint
 ./alata format
 ```
 
-`setup` uses uv to install the project's dependencies, including the development group. `test` runs pytest; `lint` and `format` use Ruff. Pass options and paths directly:
+`setup` uses uv to install the project's dependencies, including the development group, into its project environment. It accepts uv's options, including `--active` to target an activated virtualenv. `test` runs pytest; `lint` and `format` use Ruff. Pass options and paths directly:
 
 ```bash
 ./alata setup --locked
@@ -56,6 +73,8 @@ For adding or upgrading packages, use uv directly, for example `uv add httpx` or
 ### Upgrading an existing project
 
 Projects created before v0.11.0.2 need the updated root `alata` launcher and `bootstrap/console.py` from the new project template. Preserve any custom launcher changes, add `ruff>=0.16.0` to the `dev` dependency group, and run `./alata setup` after updating the framework dependency. You can remove the old Makefile once any custom targets have been accounted for.
+
+For v0.12.0.0, update `bootstrap/console.py` from the template. Run commands from your chosen Python environment or through `uv run ./alata`.
 
 ## Built-in commands
 
@@ -77,6 +96,7 @@ The framework registers this command set out of the box:
 | `migrate:sync` | Record existing migrations as applied without running their `up()` methods. |
 | `migrate:publish` | Copy framework infrastructure migrations (`--only`, `--dry-run`, `--force`). |
 | `migrate:status` | Show the status of all migrations. |
+| `schema:dump` | Save a schema snapshot; pass `--prune` to remove applied migration files. |
 | `make:migration <name>` | Generate a new migration file. |
 | `make:seeder <name>` | Generate a new database seeder class. |
 | `make:provider <name>` | Generate a service provider and register it in `bootstrap/providers.py`. |

@@ -4,7 +4,7 @@ description: Version your database schema with migration files, a fluent schema 
 icon: Table
 ---
 
-Migrations are version control for your database schema. Each migration is a small Python file that knows how to apply a change (`up`) and how to revert it (`down`). Alata tracks which migrations have run, applies pending ones in order, and can roll back the last batch — with PostgreSQL advisory locking to coordinate concurrent deploys.
+Migrations are version control for your database schema. Each migration is a small Python file that knows how to apply a change (`up`) and how to revert it (`down`). Alata tracks which migrations have run, applies pending ones in order, and can roll back the last batch on PostgreSQL, MySQL, and SQLite.
 
 ## Generating Migrations
 
@@ -49,7 +49,7 @@ Every migration subclasses `Migration` and implements two methods:
 - **`up()`** — apply the change.
 - **`down()`** — revert it. Write `down()` as the exact mirror of `up()`; rollbacks and `migrate:fresh` depend on it.
 
-Inside both methods, `self.schema` is a fluent `Schema` builder bound to the current database engine. Schema operations compile through SQLAlchemy DDL, so the same migration runs on PostgreSQL, MySQL, or SQLite.
+Inside both methods, `self.schema` is a fluent `Schema` builder bound to the current database engine. Shared schema operations compile through SQLAlchemy DDL for PostgreSQL, MySQL, and SQLite. Some operations are database-specific; see [altering tables](#altering-tables).
 
 One migration per file: the runner picks the `Migration` subclass **defined** in the file, so importing a shared helper base alongside it is safe. A file defining two of its own raises `AmbiguousMigrationError` naming both.
 
@@ -133,13 +133,15 @@ DB_CONFIG = {
 }
 ```
 
-### PostgreSQL-first execution
+### Database-specific behavior
 
-Migrations are engineered for PostgreSQL and degrade gracefully elsewhere:
+Migration commands coordinate automatically on all three databases. Failure recovery follows each database's transaction support:
 
-- **Advisory locking** — before running or rolling back, the migrator takes a PostgreSQL advisory lock. If two deploy processes run `migrate` at the same time, the second blocks until the first finishes, so a migration can never run twice concurrently.
-- **Transactional DDL** — on PostgreSQL, each migration's DDL **and** its tracking-table insert run in a single transaction. If anything fails, both roll back together: no half-applied schema, no orphaned tracking rows. A failed migration exits non-zero and leaves the database exactly as it was.
-- **MySQL / SQLite** — supported as secondary dialects. MySQL DDL auto-commits (no transactional DDL) and has no advisory lock; on failure the migrator best-effort calls the failing migration's own `down()` to clean up — and if that `down()` fails too, it prints recovery instructions instead of leaving you a warning line. Both dialects also decline a few ALTER operations — see the [dialect caveats](#altering-tables). Run production migrations on PostgreSQL.
+- **PostgreSQL** — the migrator holds an advisory lock so migration commands against the same database wait for one another. Each regular migration's DDL, data changes, and tracking-table update share a transaction and roll back together on failure. [Concurrent index builds](#concurrent-indexes) run after that transaction commits.
+- **MySQL** — a database-scoped lock serializes migration commands. DDL implicitly commits, so a whole migration cannot be rolled back atomically. On failure, Alata attempts the failing migration's `down()` and reports any cleanup failure.
+- **SQLite** — migration commands against the same database file are serialized across processes. Each migration's schema changes, data changes, and tracking record share a transaction and roll back together on failure.
+
+PostgreSQL migration locking works as follows:
 
 ```mermaid
 sequenceDiagram
@@ -153,6 +155,32 @@ sequenceDiagram
     D2->>PG: lock acquired — nothing pending
     D2->>PG: pg_advisory_unlock
 ```
+
+## Schema snapshots
+
+Save the current schema and applied migration history:
+
+```bash
+./alata schema:dump
+./alata schema:dump --connection=reporting
+./alata migrate --connection=reporting
+```
+
+Snapshots are written under `database/schema/`, separately for each connection and database driver. Commit them with your application. When `./alata migrate` encounters an empty database, it loads the matching snapshot and then runs migrations created after it.
+
+To remove applied migration files after saving the snapshot:
+
+```bash
+./alata schema:dump --prune
+```
+
+Pending migration files remain. Existing databases keep their migration history and continue normally. `migrate:status` labels pruned history as **Squashed**. New migrations can be rolled back normally; changes already incorporated into a pruned snapshot require a new migration. `migrate:fresh` rebuilds the snapshot and applies subsequent migrations.
+
+Snapshots contain schema and migration history, **not application rows**. Use [seeders](/docs/database/seeding) for reference data that a fresh database needs. Each database driver needs its own snapshot.
+
+PostgreSQL requires `pg_dump` and `psql` on the command's PATH. Use clients from the same major release as your server: [newer dump output may not restore to an older server](https://www.postgresql.org/docs/current/app-pgdump.html#APP-PGDUMP-NOTES). MySQL requires compatible MySQL `mysqldump` and `mysql` clients. SQLite needs no external client.
+
+PostgreSQL and SQLite restore transactionally; a failed MySQL restore can leave partial schema because MySQL DDL commits implicitly.
 
 ## Creating Tables
 
@@ -285,6 +313,17 @@ Index names follow `idx_<table>_<columns>` and unique constraints `uq_<table>_<c
 
 Generated names (indexes, constraints, foreign keys, enum types) are capped at 63 characters — the smallest limit among the supported dialects — and anything longer is truncated with a deterministic hash suffix. The suffix is stable across runs and identical on every dialect, so a later `drop_unique()` still names the object that was created.
 
+### Full-text indexes
+
+MySQL and PostgreSQL support full-text indexes in both `create()` and `table()` blocks:
+
+```python
+with self.schema.table("posts") as table:
+    table.full_text(["title", "body"])  # ft_posts_title_body
+```
+
+Use the same columns in [`where_full_text()`](/docs/database/query-builder#full-text-search). PostgreSQL also accepts `language="english"`; use the same language for the index and the query. Remove the index with `table.drop_full_text("ft_posts_title_body")`.
+
 ### Foreign keys
 
 ```python
@@ -326,10 +365,10 @@ table.comment("status", "Editorial workflow state")   # pass None to drop the co
 Operations run in a safe order automatically: index/constraint drops first, then column adds/changes/renames/drops, then new indexes and foreign keys. You don't have to sequence them by hand.
 </Callout>
 
-Three of these carry a dialect caveat:
+Database-specific limitations:
 
+- **SQLite rebuilds tables automatically** for column changes and primary, foreign, and table-level unique constraint changes. Existing data and schema objects are preserved; invalid changes roll back. SQLite 3.35 or newer is required.
 - **`drop_primary()` on MySQL costs the column its `AUTO_INCREMENT`.** MySQL refuses to drop the key an auto-increment column depends on, so the framework gives up `AUTO_INCREMENT` first (the column keeps its type, nullability and comment) and then drops the key. If the replacement key should keep generating values, re-declare the column. PostgreSQL is unaffected.
-- **`drop_unique()` on SQLite only works for a unique that was added to an existing table.** A unique declared inside `create()` becomes a table-level constraint that SQLite has no statement to drop; the migration raises rather than reporting a drop it did not make. Removing one needs a table rebuild: create a replacement table without the constraint, copy the rows across, drop the original, rename the replacement.
 - **Column comments are silently unavailable on SQLite.** SQLite has no column-comment syntax and stores nothing for one, so `table.comment(...)` and `schema.comment(...)` run without error and keep nothing. MySQL and PostgreSQL both persist them: MySQL has no standalone `COMMENT ON`, so the framework reads the column's current definition and restates it — type, nullability, default, character set and collation, `AUTO_INCREMENT`, generation expression and spatial SRID all survive.
 
 ### Concurrent indexes
@@ -407,7 +446,7 @@ class SeedDefaultRoles(Migration):
 This example requires a unique index on `roles.slug` and preserves existing roles. It is intentionally irreversible: those roles may predate the migration or already be assigned to users. Its `down()` stops rollback and `migrate:fresh`; remove roles through a separate migration that handles their assignments. For reversible data migrations, undo only changes the migration owns.
 
 <Callout type="info">
-Everything here runs on the same transport as the schema builder, so inside the migration runner every statement joins the migration's transaction: a failing migration rolls back its data changes together with its DDL and its tracking record. (On PostgreSQL — MySQL DDL auto-commits, as [above](#postgresql-first-execution).)
+On PostgreSQL and SQLite, these data changes join the migration's transaction, so they roll back with its DDL and tracking record if the migration fails. MySQL DDL implicitly commits; see [database-specific behavior](#database-specific-behavior).
 </Callout>
 
 ### The table gateway

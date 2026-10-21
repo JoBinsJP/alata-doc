@@ -303,7 +303,7 @@ Supported operators: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `like`, `ilike`, `no
 
 ```python
 User.where("email", "like", "%@example.com")
-User.where("name", "ilike", "ali%")        # case-insensitive (PostgreSQL)
+User.where("name", "ilike", "ali%")        # case-insensitive matching
 User.where("name", "not like", "test%")
 ```
 
@@ -458,6 +458,31 @@ author_ids = Post.where("status", "published").select("user_id")
 authors  = User.where("active", True).where_in("id", author_ids).get()
 lurkers  = User.where("active", True).where_not_in("id", author_ids).get()
 ```
+
+### JSON queries
+
+Query JSON columns on PostgreSQL, MySQL, and SQLite. Separate nested path segments with `->`:
+
+```python
+User.where_json_contains("preferences->languages", "en").get()
+User.where_json_contains("preferences->languages", ["en", "ja"]).get()
+User.where_json_contains_key("preferences->notifications").get()
+User.where_json_length("preferences->languages", ">", 1).get()
+```
+
+`where_json_doesnt_contain()` and `where_json_doesnt_contain_key()` provide the negative forms. A present key with a JSON `null` value still counts as present. Length predicates apply to arrays. Each helper also has an `or_where_...` form for chaining and works with async terminal methods such as `aget()`.
+
+These helpers are also available on `DB.table("users")` and named connections.
+
+### Full-text search
+
+Search indexed text on MySQL and PostgreSQL:
+
+```python
+Post.where_full_text(["title", "body"], "python framework").get()
+```
+
+Create a matching [full-text index](/docs/database/migrations#full-text-indexes) first. Plain search is the default. `mode="boolean"` accepts the database's native boolean-search syntax; PostgreSQL also supports `mode="websearch"` and a `language` option. `or_where_full_text()` adds an OR condition. SQLite full-text modules are not exposed through this API.
 
 ## Ordering, grouping, limit and offset
 
@@ -823,6 +848,8 @@ job = Job.where("status", "pending").order_by("id").lock_for_update(skip_locked=
 ```
 
 `shared_lock()` takes a shared lock instead (`SELECT ... FOR SHARE`), blocking writers but not other readers; it accepts the same `skip_locked` / `nowait` options.
+
+These row locks apply to PostgreSQL and MySQL. SQLite does not support row-level locks: these methods add no locking clause, and SQLite permits only one writer per database file. Use PostgreSQL or MySQL for workflows that depend on `SKIP LOCKED` or concurrent row locks.
 
 <Callout type="info">
 The `skip_locked` and `nowait` options require PostgreSQL or MySQL 8.0+ — earlier MySQL versions accept `FOR UPDATE` but not the `SKIP LOCKED` / `NOWAIT` modifiers.

@@ -4,7 +4,7 @@ description: Configure database connections and run queries with Alata's SQLAlch
 icon: Database
 ---
 
-Alata provides sync and async database queries through its fluent query builder and models. You can also use SQLAlchemy 2.0 directly for queries the builder does not cover.
+Alata provides a shared query builder, model, and migration API for PostgreSQL, MySQL, and SQLite, with sync and async database access. You can also use SQLAlchemy 2.0 directly for queries the builder does not cover.
 
 The database guides cover:
 
@@ -51,9 +51,12 @@ CONNECTIONS = {
 }
 ```
 
-The values come from your typed settings (backed by `.env`), so a fresh project only needs the usual environment variables:
+Select the database with `DB_CONNECTION` in `.env`. The generated project defaults to `pgsql`, an alias for `postgres`.
+
+For PostgreSQL:
 
 ```bash title=".env"
+DB_CONNECTION=pgsql
 DB_HOST=127.0.0.1
 DB_PORT=5432
 DB_DATABASE=alata
@@ -61,11 +64,22 @@ DB_USERNAME=postgres
 DB_PASSWORD=secret
 ```
 
-The driver comes from `DB_CONNECTION`, which defaults to `pgsql` — an accepted alias for `postgres`, so a fresh project targets PostgreSQL without setting anything. To use another database, set it explicitly:
+For MySQL, add the `mysql` extra to your framework dependency (`alata[mysql]`), run `./alata setup`, and configure the connection:
 
 ```bash title=".env"
 DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
 DB_PORT=3306
+DB_DATABASE=alata
+DB_USERNAME=alata
+DB_PASSWORD=secret
+```
+
+For SQLite, install the `sqlite` extra (`alata[sqlite]`) and use a file path. The parent directory must exist; the generated project's `database/` directory is suitable:
+
+```bash title=".env"
+DB_CONNECTION=sqlite
+DB_DATABASE=database/database.sqlite
 ```
 
 During boot, `CONNECTIONS` and `DB_CONFIG` are loaded into the config repository as `database.connections` and `database.config`, so any code can read them through the [service container](/docs/architecture/container):
@@ -90,15 +104,46 @@ Usernames and passwords are URL-encoded automatically, so credentials containing
 
 ### Dialect support
 
-- **PostgreSQL** is the primary dialect — the best-tested target, and the only one with [advisory-lock migrations](/docs/database/migrations#postgresql-first-execution) and PostgreSQL-specific features like `ilike`, targeted upserts, and `distinct_on()`.
-- **MySQL 8.0+** is supported: the framework's database test suite runs green on MySQL 8.4. [`distinct_on()`](/docs/database/query-builder#distinct) is unavailable (it raises `NotImplementedError`), and the [migrator degrades gracefully](/docs/database/migrations#postgresql-first-execution) — no transactional DDL, no advisory lock.
-- **SQLite** is wired throughout — URL building, migrations, dialect-aware identifier quoting — and suits lightweight and development use.
+The common API supports all three databases. Database-specific operations retain their own semantics:
+
+| Database | Driver installation | Migration behavior |
+| --- | --- | --- |
+| PostgreSQL | Included with `alata` | Advisory locking and transactional migrations. |
+| MySQL 8.0+ | `alata[mysql]` | Migration locking; DDL implicitly commits. |
+| SQLite 3.35+ | `alata[sqlite]` | Transactional migrations, including automatic table rebuilding for schema changes. |
+
+See [migration behavior by database](/docs/database/migrations#database-specific-behavior) for rollback guarantees and schema limitations. `ilike` and upserts work on all three; upsert conflict handling and row counts vary by database. [`distinct_on()`](/docs/database/query-builder#distinct) is PostgreSQL-specific.
+
+CI runs the full framework suite on PostgreSQL 14/16, MySQL 8.0/8.4, and SQLite with Python 3.12 and 3.14.
+
+### Read and write connections
+
+Configure existing database replicas under `read`, and the primary under `write`. Each entry inherits the connection's credentials and other settings:
+
+```python title="config/database.py"
+CONNECTIONS["default"].update({
+    "write": {"host": "database-primary"},
+    "read": {"host": ["database-replica-1", "database-replica-2"]},
+    "sticky": True,
+})
+```
+
+Reads select a replica; writes, transactions, and locking queries use the primary. With `sticky` enabled (the default), reads after a committed write also use the primary for the rest of that HTTP request or queue job. Separate replica credentials can be supplied as a list of connection dictionaries under `read`.
+
+Force a primary read when you need the latest committed data:
+
+```python
+with DB.use_writer():
+    order = Order.find(order_id)
+```
+
+HTTP requests and queue jobs receive independent routing scopes automatically. A long-running custom script can use `with DB.routing_scope():` around each unit of work. Raw SQL that cannot be identified as a simple read, including CTEs, uses the primary.
 
 ### Sync and async engines
 
 Every named connection supports both sync and async queries. Use the `a`-prefixed API in async code, such as HTTP handlers, and the sync API in synchronous code, such as console commands.
 
-Pool tuning keys (`pool_size`, `max_overflow`, `pool_pre_ping`, `pool_recycle`, `echo`) are passed straight through to SQLAlchemy's engine factory, so you can tune each connection independently.
+Pool settings (`pool_size`, `max_overflow`, `pool_pre_ping`, `pool_recycle`, `echo`) can be tuned per connection. SQLite in-memory connections ignore queue capacity settings.
 
 ## Multiple connections
 
@@ -197,6 +242,25 @@ DB.table("users").where("age", ">", 18).order_by("name").get()
 Everything above also exists on the connection proxy, scoped to that connection: `DB.connection("reporting").select(...)`, `.statement(...)`, `.aselect(...)`, `.astatement(...)`, `.table(...)`, and the transaction methods below.
 
 ## Transactions
+
+### Retrying transaction conflicts
+
+Use a callback when a complete transaction should be retried after a deadlock, serialization failure, or SQLite lock conflict:
+
+```python
+def transfer():
+    Account.where("id", sender_id).decrement("balance", amount)
+    Account.where("id", recipient_id).increment("balance", amount)
+    return "transferred"
+
+result = DB.run_transaction(transfer, attempts=3)
+```
+
+For async database calls, pass an async callback to `await DB.arun_transaction(transfer, attempts=3)`. Named connections expose both methods through `DB.connection(name)`.
+
+Each attempt starts a new transaction after the previous attempt has rolled back. `attempts` includes the first attempt and defaults to one; `retry_delay` sets the initial backoff in seconds. Validation errors, integrity violations, connection failures, and cancellation are not retried. Retries must be configured on the outermost transaction.
+
+The callback may run more than once. Send emails, publish messages, and perform other external effects after it succeeds.
 
 ### Context-managed transactions
 

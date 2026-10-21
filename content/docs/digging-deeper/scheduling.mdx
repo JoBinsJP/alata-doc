@@ -261,8 +261,10 @@ The scheduler also fires framework [events](/docs/digging-deeper/events) for eac
 Add a single cron entry on your server that invokes `schedule:run` every minute:
 
 ```bash
-* * * * * cd /path/to/project && ./alata schedule:run >> /dev/null 2>&1
+* * * * * cd /path/to/project && /path/to/project/.venv/bin/python alata schedule:run >> /dev/null 2>&1
 ```
+
+Use the absolute path to your application's Python interpreter; cron does not inherit your shell's activated environment.
 
 Each invocation evaluates all registered events, executes the due ones (one-shot events run concurrently), and exits — unless sub-minute events are due, in which case it stays alive for the remainder of the minute.
 
