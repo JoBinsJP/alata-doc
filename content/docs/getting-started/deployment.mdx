@@ -77,20 +77,23 @@ Use the absolute path to the Python environment where your application's depende
 
 ## Pinning the framework version
 
-Alata installs from its Git repository. In production builds, pin an exact tag with a uv source so deploys are reproducible:
+Alata installs from PyPI. Declare the supported release range in `pyproject.toml`:
 
 ```toml title="pyproject.toml"
 [project]
 dependencies = [
-    "alata",
+    "alata>=0.12.0.1,<0.13",
     "uvicorn>=0.40.0",
 ]
-
-[tool.uv.sources]
-alata = { git = "ssh://git@github.com/JoBinsJP/alata-core.git", tag = "v0.12.0.0" }
 ```
 
-Then `uv sync` in your build step produces the same framework version every time. Upgrading is a one-line tag bump. The repository is private — your build environment needs SSH access to it.
+Commit `uv.lock` to pin the exact framework version and its dependencies. Install that lockfile in production:
+
+```bash
+uv sync --locked --no-dev
+```
+
+To upgrade within the supported range, run `uv lock --upgrade-package alata`, test the application, and commit the updated lockfile. Change the range in `pyproject.toml` when moving to a new release series.
 
 ## Production environment settings
 
@@ -141,7 +144,7 @@ The flag file is per-filesystem. If you run multiple app servers, run `./alata d
 ## A minimal production checklist
 
 1. `APP_ENV=production`, `ENVIRONMENT=production`, `DEBUG=false` in the environment.
-2. Framework pinned to a tag via `[tool.uv.sources]`.
+2. Dependencies pinned in a committed `uv.lock` and installed with `uv sync --locked --no-dev`.
 3. `./alata migrate` run as a deploy step (check with `./alata migrate:status`).
 4. Uvicorn on `bootstrap.app:app` behind your load balancer, `TRUSTED_HOSTS` set.
 5. Workers on `bootstrap.broker:broker` under a supervisor.
