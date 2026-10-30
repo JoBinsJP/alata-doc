@@ -62,7 +62,15 @@ schedule.job("reports:generate", user_id="abc", queue="reports").hourly()
 schedule.job("emails:digest").daily().on_queue("emails")
 ```
 
-The task must be registered on the scheduler's broker. Import its task module in `schedule()` before calling `schedule.job()`; worker task discovery does not run in the scheduler process. An unknown task fails the event and is logged.
+You can also pass a `ShouldQueue` class directly:
+
+```python
+from app.jobs.generate_report import GenerateReport
+
+schedule.job(GenerateReport, user_id=42).daily_at("02:00").on_queue("reports")
+```
+
+Jobs referenced by name are discovered using the application's [queue configuration](/docs/digging-deeper/queues#automatic-discovery). An unknown task fails the event and is logged.
 
 ### Callables
 

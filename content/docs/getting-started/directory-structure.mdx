@@ -24,6 +24,7 @@ my-app/
 │   │   ├── controllers/      # request handlers
 │   │   ├── dependencies.py   # reusable route dependencies
 │   │   └── middleware.py     # custom HTTP middleware
+│   ├── jobs/                 # ShouldQueue job classes
 │   ├── models/               # database models
 │   ├── providers/            # your service providers
 │   ├── services/             # domain / business logic
@@ -78,9 +79,10 @@ Everything you write lives here.
 - **`app/exceptions/handler.py`** — your `Handler` subclass of the framework's exception handler. Configure `dont_report` (exceptions that should not be logged) and register custom `renderable` / `reportable` callbacks. See [error handling](/docs/basics/error-handling).
 - **`app/http/`** — controllers, route dependencies, and middleware. The template ships a `WelcomeController`, an `IdentityMiddleware` that resolves the acting user from `X-User-Id` / `X-Guest-Id` headers, and `require_authenticated` / `get_user_id` dependencies. These are identity examples; add credential verification for authenticated routes.
 - **`app/models/`** — your [database models](/docs/database/models).
+- **`app/jobs/`** — [queued job classes](/docs/digging-deeper/queues#creating-jobs). `./alata make:job` generates a `ShouldQueue` class here; workers discover jobs recursively.
 - **`app/providers/`** — your [service providers](/docs/architecture/providers). `./alata make:provider` scaffolds one here and registers it for you. A `*_provider.py` file that exists here but is not declared in `bootstrap/providers.py` triggers a startup warning — providers are never auto-loaded.
 - **`app/services/`** — plain Python domain logic, typically bound into the container by a provider.
-- **`app/tasks/`** — [queue task](/docs/digging-deeper/queues) definitions. The worker discovers tasks matching `app/tasks/*_tasks.py`.
+- **`app/tasks/`** — decorated [queue functions](/docs/digging-deeper/queues#defining-tasks). Workers discover modules recursively, with any filename.
 
 ## `bootstrap/` — the kernel
 

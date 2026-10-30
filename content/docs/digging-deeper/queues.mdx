@@ -231,6 +231,93 @@ Asking a discarded job for its result never blocks. The result is reported as re
 Use `null` only when discarding jobs is intentional. Dispatch succeeds without a warning for each job; result lookups report that the job was discarded.
 </Callout>
 
+## Creating jobs
+
+Create a job with the project CLI:
+
+```bash
+./alata make:job SendWelcomeEmail
+```
+
+The generated class lives in `app/jobs/send_welcome_email.py`. Extend `ShouldQueue` and put the work in `handle()`:
+
+```python title="app/jobs/send_welcome_email.py"
+from alata.queue import ShouldQueue
+
+
+class SendWelcomeEmail(ShouldQueue):
+    queue = "emails"
+    max_retries = 3
+
+    async def handle(self, user_id: int) -> None:
+        # Load the user and send their welcome email.
+        ...
+```
+
+Dispatch it from an async handler or service:
+
+```python
+from app.jobs.send_welcome_email import SendWelcomeEmail
+
+await SendWelcomeEmail.dispatch(user_id=42)
+await SendWelcomeEmail.on_queue("urgent").dispatch(user_id=42)
+```
+
+Start a worker listening to those queues with `./alata queue:work --queue=emails,urgent`, or configure them in [Horizon](/docs/packages/horizon).
+
+Job inputs are the arguments to `handle()`. Both `async def handle()` and synchronous `def handle()` are supported; synchronous handlers run in the worker's executor. The framework creates a fresh job instance for every attempt. Put services and runtime resources inside the handler rather than requiring constructor arguments.
+
+| Class setting | Default | Purpose |
+| --- | --- | --- |
+| `queue` | Application queue | Destination queue; `on_queue()` overrides one dispatch. |
+| `max_retries` | Application retry limit | Maximum total attempts, including the first. Set `1` for a single attempt. |
+| `retry_delay` | Application retry delay | Seconds between failed attempts. |
+| `tags` | `()` | Tags shown in Horizon, e.g. `("billing", "invoices")`. |
+| `task_name` | Module path and class name | Optional stable identity for jobs that may move between modules. |
+
+Class jobs use the application's retry policy automatically. To handle a permanent failure, add `failed()` to the class. It receives the exception and the original dispatch arguments, and may be synchronous or async:
+
+```python
+async def failed(self, exception: BaseException, user_id: int) -> None:
+    # Record or report the failed delivery.
+    ...
+```
+
+The failure hook receives a fresh instance, so pass the information it needs as job arguments. `dispatch()` returns a task handle; use `await dispatched.wait_result()` when you need the outcome and have configured result storage.
+
+### Automatic discovery
+
+Alata and Horizon workers discover jobs in `app/jobs/` and decorated functions in `app/tasks/`, including subfolders. Filenames are unrestricted. For example, `./alata make:job Billing/GenerateInvoice` creates `app/jobs/billing/generate_invoice.py`.
+
+To use additional packages or individual modules, set the list in `config/queue.py`:
+
+```python
+QUEUE_CONFIG["task_modules"] = [
+    "app.jobs",
+    "app.tasks",
+    "app.billing.jobs",
+]
+```
+
+Packages are searched recursively. The scheduler uses the same settings when resolving a job by name. Restart workers after deploying new job code.
+
+### Batching and scheduling job classes
+
+Use job classes with the existing batch and scheduler APIs:
+
+```python
+from alata.queue.batch import Batch, job
+from app.jobs.send_welcome_email import SendWelcomeEmail
+
+await Batch.create("Welcome emails", [
+    job(SendWelcomeEmail, user_id=42),
+    job(SendWelcomeEmail, user_id=43),
+]).dispatch()
+
+# Inside your console kernel's schedule() method:
+schedule.job(SendWelcomeEmail, user_id=42).daily_at("09:00")
+```
+
 ## Defining tasks
 
 Tasks live in `app/tasks/` and are functions decorated with `@broker.task`. Both `async def` and synchronous `def` tasks are supported. Import the broker from `bootstrap/broker.py`:
@@ -245,11 +332,7 @@ async def generate_report_task(user_id: str, report_id: int) -> None:
     ...
 ```
 
-Give every task an explicit `task_name`. The name is what gets serialized into messages, stored with failed jobs, and used to look tasks up when retrying — a stable name survives moving or renaming the function.
-
-<Callout type="warn">
-The worker discovers task modules matching `app/tasks/*_tasks.py`. A task defined in a file that doesn't end in `_tasks.py` will dispatch fine but **never execute**, because no worker imports it.
-</Callout>
+An explicit `task_name` gives the task a stable identity that survives moving or renaming the function. Otherwise, its module path and function name identify it. Existing decorated tasks work alongside `ShouldQueue` jobs.
 
 Retry behavior is declared as decorator keyword arguments — taskiq stores them as message *labels* that travel with every dispatch:
 
@@ -339,7 +422,7 @@ Options:
 ./alata queue:work --reload
 ```
 
-Pass `-v` (or `-vv`/`-vvv`) to raise worker log output to `DEBUG`. The command discovers task modules matching `app/tasks/*_tasks.py` and starts the worker against `bootstrap.broker:broker`.
+Pass `-v` (or `-vv`/`-vvv`) to raise worker log output to `DEBUG`. Workers use the application's [automatic discovery](#automatic-discovery) settings.
 
 An explicit `--queue` takes precedence over configured queue names. Without it, workers use `QUEUE_NAME` for Redis/database or `SQS_QUEUE_NAME` for SQS.
 
@@ -355,6 +438,16 @@ Failed tasks are handled by the framework's `RetryMiddleware`, attached automati
 - **`max_retries`** — maximum total attempts. Defaults to `QUEUE_CONFIG["max_retries"]` (`QUEUE_MAX_RETRIES`, default 3).
 - **`delay`** — seconds to wait before re-dispatching. Omit it to use `QUEUE_CONFIG["retry_delay"]` (`QUEUE_RETRY_DELAY`, default 60); set it to `0` to retry immediately.
 
+To retry only specific exceptions, set `types_of_exceptions` on the task decorator:
+
+```python
+@broker.task(retry_on_error=True, types_of_exceptions=[TimeoutError, ConnectionError])
+async def synchronize_account(account_id: int):
+    ...
+```
+
+This overrides the broker's exception filter for this task. An empty list disables retries for all exceptions. Declare exception classes on the decorator; dispatch labels cannot carry Python classes.
+
 A failed attempt is re-dispatched with an incremented internal `_retries` counter and the **same task id**, so a retried job is one logical job across attempts. An attempt retries while `attempts < max_retries`; once the limit is reached the failure is final.
 
 #### Who waits out the backoff
@@ -369,7 +462,7 @@ The effective delay is the same either way, whether it came from the task's `del
 Two failures never retry, regardless of labels:
 
 - **`NoResultError`** — the task is opting out of storing a result, not reporting a failure.
-- an exception outside **`types_of_exceptions`**, when the retry middleware has been narrowed to specific types.
+- an exception outside **`types_of_exceptions`**, when the task or broker has been narrowed to specific types.
 
 Both are treated as final outcomes everywhere, including batch accounting.
 

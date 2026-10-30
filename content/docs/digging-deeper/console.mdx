@@ -254,6 +254,7 @@ This loads `.env` followed by `.env.testing`. Configure database connection valu
 
 The `make:*` commands scaffold files into your project:
 
+- **`make:job <name>`** — generates a `ShouldQueue` job in `app/jobs/`. Use `./alata make:job SendWelcomeEmail` or a nested name such as `Billing/GenerateInvoice`. See [queues](/docs/digging-deeper/queues#creating-jobs).
 - **`make:migration <name>`** — generates a timestamped migration file. Name it after the change, e.g. `./alata make:migration create_users_table`. See [database getting started](/docs/database/getting-started).
 - **`make:seeder <name>`** — generates a seeder class in `database/seeders/`. Either naming style works: `user`, `user_seeder`, and `UserSeeder` all produce `user_seeder.py` with a `UserSeeder` class. See [seeding](/docs/database/seeding).
 - **`make:provider <name>`** — generates `app/providers/<name>_provider.py` from a stub **and** appends it to the `PROVIDERS` list in `bootstrap/providers.py`, so it boots immediately:
