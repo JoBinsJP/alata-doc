@@ -105,6 +105,7 @@ The framework registers this command set out of the box:
 | `up` | Bring the application out of maintenance mode. |
 | `down` | Put the application into maintenance mode. |
 | `queue:work` | Start a queue worker process (`--queue`, `--workers`, `--reload`). |
+| `queue:listen` | Run one development worker with code reload (`--queue`). |
 | `queue:failed` | List failed jobs (`--limit`, default 20). |
 | `queue:retry <uuid>` | Re-dispatch a failed job back to the queue (or `--all`). |
 | `queue:flush` | Delete all failed jobs. |

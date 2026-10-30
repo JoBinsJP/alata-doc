@@ -56,14 +56,9 @@ Start a worker with the console command:
 ./alata queue:work --queue high,default --workers 4
 ```
 
-`--queue` overrides the configured queue. Redis and database workers accept a comma-separated priority list (leftmost is highest); SQS accepts one queue. See [queue worker configuration](/docs/digging-deeper/queues#running-workers). Under the hood this runs the taskiq CLI, which you can invoke directly in a container entrypoint or process manager:
+`--queue` overrides the configured queue. Redis and database workers accept a comma-separated priority list (leftmost is highest); SQS accepts one queue. See [queue worker configuration](/docs/digging-deeper/queues#running-workers).
 
-```bash
-python -m taskiq worker bootstrap.broker:broker \
-  --workers 4
-```
-
-Either way, the target is `bootstrap.broker:broker` — the broker resolved from your booted kernel. Run workers under a supervisor (systemd, or a container orchestrator with restart policies) so they come back after crashes and deploys. For a full dashboard and worker supervisor, see [Horizon](/docs/packages/horizon).
+Run workers under a process manager, such as systemd or a container orchestrator with restart policies, and restart them after deploying code changes. For a dashboard and worker management, see [Horizon](/docs/packages/horizon). Use `./alata queue:listen` with code reload during local development.
 
 ## The scheduler
 
